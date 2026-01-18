@@ -994,10 +994,13 @@ async def update_plugin_config(
 
 
 @router.post("/api/plugin/update-token")
-async def plugin_update_token(request: dict, authorization: Optional[str] = Header(None)):
+async def plugin_update_token(request: Request, body: dict, authorization: Optional[str] = Header(None)):
     """Receive token update from Chrome extension (no admin auth required, uses connection_token)"""
     # Verify connection token
     plugin_config = await db.get_plugin_config()
+
+    # Extract session token from body
+    session_token = body.get("session_token")
 
     # Extract token from Authorization header
     provided_token = None
@@ -1010,9 +1013,6 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     # Check if token matches
     if not plugin_config.connection_token or provided_token != plugin_config.connection_token:
         raise HTTPException(status_code=401, detail="Invalid connection token")
-
-    # Extract session token from request
-    session_token = request.get("session_token")
 
     if not session_token:
         raise HTTPException(status_code=400, detail="Missing session_token")

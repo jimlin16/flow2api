@@ -389,11 +389,14 @@ class TokenManager:
                 return None
 
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试通过浏览器刷新 ST...")
+            
+            # Derive account_id from current ST
+            account_id = token.st[:16] if token.st else "default"
 
             from .browser_captcha_personal import BrowserCaptchaService
             service = await BrowserCaptchaService.get_instance(self.db)
 
-            new_st = await service.refresh_session_token(token.current_project_id)
+            new_st = await service.refresh_session_token(token.current_project_id, account_id)
             if new_st and new_st != token.st:
                 # 更新数据库中的 ST
                 await self.db.update_token(token_id, st=new_st)
