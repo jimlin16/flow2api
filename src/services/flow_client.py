@@ -22,7 +22,7 @@ class FlowClient:
         # 缓存每个账号的 User-Agent
         self._user_agent_cache = {}
 
-    def _generate_user_agent(self, account_id: str = None) -> str:
+    async def _generate_user_agent(self, account_id: str = None) -> str:
         """基于账号ID生成固定的 User-Agent
         
         Args:
@@ -38,6 +38,26 @@ class FlowClient:
         # 如果已缓存，直接返回
         if account_id in self._user_agent_cache:
             return self._user_agent_cache[account_id]
+            
+        # 0. 優先嘗試從 BrowserCaptchaService 獲取一致的 UA (browser 或 personal 模式)
+        if config.captcha_method in ["browser", "personal"]:
+            try:
+                if config.captcha_method == "browser":
+                    from .browser_captcha import BrowserCaptchaService
+                    service_cls = BrowserCaptchaService
+                else:
+                    from .browser_captcha_personal import BrowserCaptchaService
+                    service_cls = BrowserCaptchaService
+
+                # 這裡假設 service 已經初始化過或我們可以獲取實例
+                if service_cls._instance:
+                    real_ua = await service_cls._instance.get_user_agent(account_id)
+                    if real_ua:
+                        # 緩存它
+                        self._user_agent_cache[account_id] = real_ua
+                        return real_ua
+            except Exception:
+                pass
         
         # 使用账号ID作为随机种子，确保同一账号生成相同的UA
         import hashlib
@@ -129,7 +149,7 @@ class FlowClient:
         # 通用请求头
         headers.update({
             "Content-Type": "application/json",
-            "User-Agent": self._generate_user_agent(account_id)
+            "User-Agent": await self._generate_user_agent(account_id)
         })
 
         # Log request
@@ -151,8 +171,7 @@ class FlowClient:
                         url,
                         headers=headers,
                         proxy=proxy_url,
-                        timeout=self.timeout,
-                        impersonate="chrome110"
+                        timeout=self.timeout
                     )
                 else:  # POST
                     response = await session.post(
@@ -160,8 +179,7 @@ class FlowClient:
                         headers=headers,
                         json=json_data,
                         proxy=proxy_url,
-                        timeout=self.timeout,
-                        impersonate="chrome110"
+                        timeout=self.timeout
                     )
 
                 duration_ms = (time.time() - start_time) * 1000
@@ -590,16 +608,20 @@ class FlowClient:
         sys.stderr.write(f"[DEBUG] _get_recaptcha_token method: {captcha_method}\n")
         sys.stderr.flush()
 
-        if captcha_method == "browser":
+        if captcha_method in ["browser", "personal"]:
             try:
-                from .browser_captcha import BrowserCaptchaService
+                if captcha_method == "browser":
+                    from .browser_captcha import BrowserCaptchaService
+                else:
+                    from .browser_captcha_personal import BrowserCaptchaService
+                
                 service = await BrowserCaptchaService.get_instance(self.db)
                 token = await service.get_token(project_id, account_id)
-                sys.stderr.write(f"[DEBUG] _get_recaptcha_token obtained: {'Yes' if token else 'No'}\n")
+                sys.stderr.write(f"[DEBUG] _get_recaptcha_token obtained ({captcha_method}): {'Yes' if token else 'No'}\n")
                 sys.stderr.flush()
                 return token
             except Exception as e:
-                debug_logger.log_error(f"[reCAPTCHA Browser] error: {str(e)}")
+                debug_logger.log_error(f"[reCAPTCHA {captcha_method}] error: {str(e)}")
                 return None
         elif captcha_method in ["yescaptcha", "capmonster", "ezcaptcha", "capsolver"]:
              # 这里省略了 _get_api_captcha_token 的实现,因为当前主要调试 browser

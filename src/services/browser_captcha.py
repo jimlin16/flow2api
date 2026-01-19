@@ -70,6 +70,11 @@ class BrowserCaptchaService:
         self.contexts: Dict[str, BrowserContext] = {}  # account_id -> BrowserContext
         self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
         self.db = db
+        self._fixed_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+    def get_user_agent(self, account_id: str = "default") -> str:
+        """獲取瀏覽器使用的 User-Agent"""
+        return getattr(self, '_fixed_user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
     @classmethod
     async def get_instance(cls, db=None) -> 'BrowserCaptchaService':
@@ -78,7 +83,6 @@ class BrowserCaptchaService:
             async with cls._lock:
                 if cls._instance is None:
                     cls._instance = cls(db)
-                    # The global initialize() is no longer needed as initialization is per-account
                     # await cls._instance.initialize()
         return cls._instance
 
@@ -108,11 +112,12 @@ class BrowserCaptchaService:
             import sys
             import shutil
             
-            user_data_dir = f'/app/browser_data/{account_id}'
+            # Use relative path for cross-platform compatibility
+            user_data_dir = os.path.join(os.getcwd(), 'browser_data', account_id)
             os.makedirs(user_data_dir, exist_ok=True)
             
             sys.stderr.write(f"\n[DIAG] Current Directory: {os.getcwd()}\n")
-            sys.stderr.write(f"[DIAG] /app/browser_data exists: {os.path.exists(user_data_dir)}\n")
+            sys.stderr.write(f"[DIAG] User Data Dir: {user_data_dir}\n")
             if os.path.exists(user_data_dir):
                 sys.stderr.write(f"[DIAG] Files in {user_data_dir}: {os.listdir(user_data_dir)}\n")
             
@@ -125,12 +130,34 @@ class BrowserCaptchaService:
                         os.remove(p)
                         sys.stderr.write(f"[DIAG] Removed lock file: {lf}\n")
                     except Exception as e:
-                        sys.stderr.write(f"[DIAG] Failed to remove lock file {lf}: {e}\n")
+                        pass # Ignore errors
 
             # self.playwright = await async_playwright().start() # Already started in ensure_playwright
 
+            # 定義統一的 User-Agent
+            self._fixed_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            
+            # 嘗試從 DB 獲取自定義 UA (例如 Android UA)
+            current_ua = self._fixed_user_agent
+            if self.db and account_id != "default":
+                try:
+                    token_info = await self.db.get_token_by_email(account_id)
+                    if token_info and token_info.st:
+                        import json
+                        st_data = json.loads(token_info.st)
+                        if isinstance(st_data, dict) and st_data.get("user_agent"):
+                            current_ua = st_data.get("user_agent")
+                            debug_logger.log_info(f"[BrowserCaptcha] 使用自定義 User-Agent: {current_ua[:50]}...")
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] 獲取 UA 失敗: {e}")
+            
+            # 更新實例變量以便 get_user_agent 使用 (注意：這里可能會有並發覆蓋問題，但簡單場景下尚可)
+            self._fixed_user_agent = current_ua 
+
             launch_options = {
+                # 'user_data_dir' is passed as positional arg 1, do not include in kwargs
                 'headless': self.headless,
+                'bypass_csp': True, # 繞過 CSP 限制
                 'args': [
                     '--disable-blink-features=AutomationControlled',
                     '--disable-dev-shm-usage',
@@ -142,7 +169,11 @@ class BrowserCaptchaService:
                     '--no-first-run',
                     '--no-default-browser-check',
                     '--remote-debugging-port=0'
-                ]
+                ],
+                'viewport': {'width': 1920, 'height': 1080},
+                'user_agent': self._fixed_user_agent, # Unified UA
+                'locale': 'en-US',
+                'timezone_id': 'America/New_York'
             }
 
             if proxy_url:
@@ -154,18 +185,15 @@ class BrowserCaptchaService:
             
             try:
                 # 使用 launch_persistent_context
+                # 注意: user_data_dir 是位置參數 1
                 context = await self.playwright.chromium.launch_persistent_context(
                     user_data_dir,
-                    **launch_options,
-                    viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    locale='en-US',
-                    timezone_id='America/New_York'
+                    **launch_options
                 )
             except Exception as launch_err:
                 sys.stderr.write(f"[CRITICAL] launch_persistent_context FAILED: {launch_err}\n")
                 # 嘗試查找系統安裝的 chrome 作為備選
-                sys_chrome = shutil.which('google-chrome') or shutil.which('chromium')
+                sys_chrome = shutil.which('google-chrome') or shutil.which('chromium') or shutil.which('chrome.exe')
                 if sys_chrome:
                     sys.stderr.write(f"[DIAG] Retrying with explicit path: {sys_chrome}\n")
                     context = await self.playwright.chromium.launch_persistent_context(
@@ -173,7 +201,7 @@ class BrowserCaptchaService:
                         executable_path=sys_chrome,
                         **launch_options,
                         viewport={'width': 1920, 'height': 1080},
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        user_agent=self._fixed_user_agent,
                         locale='en-US',
                         timezone_id='America/New_York'
                     )
@@ -226,15 +254,21 @@ class BrowserCaptchaService:
                 );
             """)
 
-            # 添加 Trusted Types 策略以解決 Google Labs 的安全限制
+            # Add Trusted Types policy to allow creating script URLs
             await context.add_init_script("""
-                if (window.trustedTypes && !window.trustedTypes.defaultPolicy) {
+                if (window.trustedTypes && window.trustedTypes.createPolicy) {
                     window.trustedTypes.createPolicy('default', {
-                        createScriptURL: (url) => url,
-                        createHTML: (html) => html,
-                        createScript: (script) => script,
+                        createHTML: (string, sink) => string,
+                        createScript: (string, sink) => string,
+                        createScriptURL: (string, sink) => string,
                     });
                 }
+                
+                // CRITICAL: Override platform to match Windows User-Agent
+                // Otherwise UA=Windows but Platform=Linux is a dead giveaway
+                Object.defineProperty(navigator, 'platform', {
+                    get: () => 'Win32'
+                });
             """)
 
             self.contexts[account_id] = context
@@ -244,7 +278,7 @@ class BrowserCaptchaService:
             debug_logger.log_error(f"[BrowserCaptcha] ❌ 瀏覽器帳號 [{account_id}] 啟動失敗: {str(e)}")
             raise
 
-    async def get_token(self, project_id: str, account_id: str = "default") -> Optional[str]:
+    async def get_token(self, project_id: str, account_id: str = "default", st: str = None) -> Optional[str]:
         """获取 reCAPTCHA token"""
         try:
             await self.initialize_for_account(account_id)
@@ -252,9 +286,106 @@ class BrowserCaptchaService:
             if not context:
                 raise Exception(f"無法獲取帳號 [{account_id}] 的瀏覽器上下文")
 
+            # 注入 Session Token (如果提供)
+            if st:
+                try:
+                    import json
+                    debug_logger.log_info(f"[BrowserCaptcha] 正在解析 Session Token...")
+                    st_data = json.loads(st)
+                    cookie_dict = {}
+                    
+                    if isinstance(st_data, dict) and "cookies" in st_data:
+                        cookie_dict = st_data.get("cookies", {})
+                    elif isinstance(st_data, dict):
+                        cookie_dict = st_data
+                    
+                    cookies_to_add = []
+                    for name, value in cookie_dict.items():
+                        # Domain logic
+                        if name.startswith("__Secure-") or name.startswith("__Host-"):
+                            domain = "labs.google" # 安全 cookie
+                        elif name.startswith("_ga") or name == "SOCS" or name == "AEC":
+                            domain = ".google.com" # 通用
+                        else:
+                            domain = ".labs.google" # 默認
+
+                        cookies_to_add.append({
+                            "name": name,
+                            "value": value,
+                            "domain": domain,
+                            "path": "/",
+                        })
+                    
+                    if cookies_to_add:
+                        # 先清除舊的可能衝突的 cookies? 不，persistent context 保留比較好。
+                        # 但為了確保更新，add_cookies 會覆蓋同名 cookie。
+                        await context.add_cookies(cookies_to_add)
+                        debug_logger.log_info(f"[BrowserCaptcha] 成功注入 {len(cookies_to_add)} 個 Cookie")
+                        
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] Cookie 解析或注入失敗: {e}")
+
             # 定义访问URL
             website_url = f"https://labs.google/fx/project/{project_id}"
             
+            # 嘗試注入 Cookie (通過 DB 查詢 ST)
+            if self.db and account_id and account_id != "default":
+                try:
+                    token_info = await self.db.get_token_by_email(account_id)
+                    if token_info and token_info.st:
+                        import json
+                        debug_logger.log_info(f"[BrowserCaptcha] 為帳號 {account_id} 注入 Cookies...")
+                        
+                        try:
+                            st_data = json.loads(token_info.st)
+                            cookie_dict = {}
+                            
+                            if isinstance(st_data, dict) and "cookies" in st_data:
+                                cookie_dict = st_data.get("cookies", {})
+                            elif isinstance(st_data, dict):
+                                cookie_dict = st_data
+                            
+                            cookies_to_add = []
+                            for name, value in cookie_dict.items():
+                                # Domain logic - Google 認證 Cookie 通常在 .google.com
+                                if name in ["SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID"]:
+                                    domain = ".google.com"
+                                elif name.startswith("__Secure-") or name.startswith("__Host-"):
+                                     # 其他安全 cookie 嘗試 .google.com，如果不行為 labs.google
+                                    domain = ".google.com" 
+                                elif name.startswith("_ga") or name == "SOCS" or name == "AEC" or name == "NID":
+                                    domain = ".google.com"
+                                else:
+                                    # 應用層 cookie
+                                    domain = ".labs.google"
+
+                                # Set basic attributes
+                                cookie_obj = {
+                                    "name": name,
+                                    "value": value,
+                                    "domain": domain,
+                                    "path": "/",
+                                }
+
+                                # Critical: Enforce flags for Secure cookies to prevent browser rejection
+                                if name.startswith("__Secure-") or name.startswith("__Host-"):
+                                    cookie_obj["secure"] = True
+                                    # cookie_obj["sameSite"] = "None" # Sometimes causing issues if not strict
+                                
+                                # Google authentication cookies often need secure
+                                if name in ["SID", "HSID", "SSID", "APISID", "SAPISID", "OSID"]:
+                                    cookie_obj["secure"] = True
+
+                                cookies_to_add.append(cookie_obj)
+                            
+                            if cookies_to_add:
+                                await context.add_cookies(cookies_to_add)
+                                debug_logger.log_info(f"[BrowserCaptcha] 成功注入 {len(cookies_to_add)} 個 Cookie")
+                        except json.JSONDecodeError:
+                            debug_logger.log_warning(f"[BrowserCaptcha] ST 解析失敗 (JSONError)")
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] Cookie 注入過程異常: {e}")
+
             sys.stderr.write(f"\n[DEBUG] BrowserCaptcha.get_token started for: {website_url}\n")
             sys.stderr.flush()
 
@@ -262,8 +393,7 @@ class BrowserCaptchaService:
             # context = None  <-- This WAS shadow-resetting the context, removed!
 
             # 使用固定的 User-Agent 以匹配手動登錄會話
-            # 這是手動登錄時使用的 UA，不匹配會導致 Google 登錄失效
-            selected_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            selected_ua = self._fixed_user_agent
             sys.stderr.write(f"[DEBUG] Using Session User-Agent: {selected_ua}\n")
 
             # 註冊 console 監聽器以讀取注入腳本的 log

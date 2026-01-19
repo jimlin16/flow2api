@@ -46,6 +46,10 @@ class BrowserCaptchaService:
         self._account_resident_tabs: dict[str, dict[str, ResidentTabInfo]] = {}
         self._resident_lock = asyncio.Lock()  # 保护常驻标签页操作
 
+        # 守護進程狀態
+        self._watchdog_tasks: dict[str, asyncio.Task] = {}
+        self._is_shutting_down = False
+
     @classmethod
     async def get_instance(cls, db=None) -> 'BrowserCaptchaService':
         """获取单例实例"""
@@ -54,6 +58,38 @@ class BrowserCaptchaService:
                 if cls._instance is None:
                     cls._instance = cls(db)
         return cls._instance
+
+    async def get_user_agent(self, account_id: str = "default") -> str:
+        """获取当前浏览器的 User-Agent"""
+        await self.initialize_for_account(account_id)
+        browser = self.browser_instances.get(account_id)
+        if browser:
+            # 简单方式：通过 evaluate 获取 (nodriver browser 对象没有直接的 ua 属性，通常需要通过 tab)
+            # 我們可以嘗試從配置中獲取，或者打開一個臨時標籤頁
+            try:
+                # 為了避免頻繁打開標籤頁，我們可以緩存它
+                if hasattr(self, f'_ua_{account_id}'):
+                    return getattr(self, f'_ua_{account_id}')
+                
+                # 由於獲取 UA 需要一個 tab，如果已經有常駐 tab，用它
+                project_id = self.get_resident_project_id(account_id)
+                if project_id:
+                     resident_info = self._account_resident_tabs[account_id][project_id]
+                     if resident_info and resident_info.tab:
+                         ua = await resident_info.tab.evaluate("navigator.userAgent")
+                         setattr(self, f'_ua_{account_id}', ua)
+                         return ua
+                
+                # 否則新建一個 (這可能會慢一點)
+                tab = await browser.get("about:blank", new_tab=True)
+                ua = await tab.evaluate("navigator.userAgent")
+                await tab.close()
+                setattr(self, f'_ua_{account_id}', ua)
+                return ua
+            except Exception as e:
+                debug_logger.log_warning(f"Failed to get UA from browser: {e}")
+                
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     async def initialize_for_account(self, account_id: str):
         """為特定帳號初始化 nodriver 瀏覽器"""
@@ -78,6 +114,19 @@ class BrowserCaptchaService:
             # 確保 user_data_dir 存在
             os.makedirs(user_data_dir, exist_ok=True)
 
+            # [清理性優化] 啟動前先檢查並殺失掉可能殘留的相同 Profile 瀏覽器進程
+            import psutil
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if proc.info['name'] == 'chrome.exe':
+                        cmdline = " ".join(proc.info['cmdline'] or []).lower()
+                        # 如果命令行包含當前帳號的 profile 目錄，則將其殺掉
+                        if user_data_dir.lower() in cmdline:
+                            debug_logger.log_info(f"[BrowserCaptcha] 發現殘留進程 (PID: {proc.info['pid']})，正在清理...")
+                            proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
             # 啟動 nodriver 瀏覽器
             browser = await uc.start(
                 headless=self.headless,
@@ -90,15 +139,66 @@ class BrowserCaptchaService:
                     '--disable-gpu',
                     '--window-size=1280,720',
                     '--profile-directory=Default',
+                    '--start-minimized',
                 ]
             )
 
             self.browser_instances[account_id] = browser
             debug_logger.log_info(f"[BrowserCaptcha] ✅ 帳號 [{account_id}] 的 nodriver 瀏覽器已啟動")
 
+            # 啟動看門狗監控
+            if account_id not in self._watchdog_tasks or self._watchdog_tasks[account_id].done():
+                self._watchdog_tasks[account_id] = asyncio.create_task(self._monitor_browser(account_id))
+
         except Exception as e:
             debug_logger.log_error(f"[BrowserCaptcha] ❌ 帳號 [{account_id}] 瀏覽器啟動失敗: {str(e)}")
             raise
+
+    async def _monitor_browser(self, account_id: str):
+        """監控瀏覽器狀態的看門狗任務"""
+        debug_logger.log_info(f"[BrowserCaptcha] 🛡️ 帳號 [{account_id}] 瀏覽器守護進程已就緒")
+        try:
+            while not self._is_shutting_down:
+                await asyncio.sleep(5)
+                
+                if self._is_shutting_down:
+                    break
+
+                browser = self.browser_instances.get(account_id)
+                needs_restart = False
+
+                if not browser:
+                    needs_restart = True
+                else:
+                    try:
+                        if browser.stopped:
+                            needs_restart = True
+                    except Exception:
+                        needs_restart = True
+
+                if needs_restart and not self._is_shutting_down:
+                    debug_logger.log_warning(f"[BrowserCaptcha] ⚠️ 檢測到帳號 [{account_id}] 的瀏覽器已關閉或無響應！")
+                    debug_logger.log_info(f"[BrowserCaptcha] 🛡️ 守護進程將在 5 秒後自動重啟窗口...")
+                    
+                    # 清理舊標籤頁緩存，防止重啟後狀態衝突
+                    async with self._resident_lock:
+                        if account_id in self._account_resident_tabs:
+                             self._account_resident_tabs[account_id] = {}
+                             
+                    await asyncio.sleep(5)
+                    
+                    if not self._is_shutting_down:
+                        try:
+                            # 重新開啟登錄窗口以維持在線
+                            await self.open_login_window(account_id)
+                            debug_logger.log_info(f"[BrowserCaptcha] ✅ 帳號 [{account_id}] 瀏覽器已重啟")
+                        except Exception as e:
+                            debug_logger.log_error(f"[BrowserCaptcha] ❌ 守護進程嘗試重啟失敗: {e}")
+                            
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            debug_logger.log_error(f"[BrowserCaptcha] 帳號 [{account_id}] 守護進程異常退出: {e}")
 
     # ========== 常驻模式 API ==========
 
@@ -416,6 +516,14 @@ class BrowserCaptchaService:
 
     async def close(self):
         """关闭所有浏览器实例"""
+        self._is_shutting_down = True
+        debug_logger.log_info("[BrowserCaptcha] 正在關閉瀏覽器服務並停止守護進程...")
+        
+        # 取消所有看門狗
+        for account_id, task in self._watchdog_tasks.items():
+            if not task.done():
+                task.cancel()
+        
         try:
             async with self._resident_lock:
                 for account_id in list(self.browser_instances.keys()):

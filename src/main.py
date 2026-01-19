@@ -86,22 +86,25 @@ async def lifespan(app: FastAPI):
         browser_service = await BrowserCaptchaService.get_instance(db)
         print("✓ Browser captcha service initialized (nodriver mode)")
         
-        # 启动常驻模式：从第一个可用token获取project_id
+        # 启动常驻模式：从第一个可用token获取 account_id
         tokens = await token_manager.get_all_tokens()
-        resident_project_id = None
-        for t in tokens:
-            if t.current_project_id and t.is_active:
-                resident_project_id = t.current_project_id
-                break
+        account_id = "default"
+        if tokens:
+            account_id = tokens[0].email
+            
+        # 預先初始化並打開登錄窗口 (改為異步背景執行，避免阻塞服務啟動)
+        async def delayed_browser_start(acc_id):
+            try:
+                # 給予系統一點緩衝時間
+                await asyncio.sleep(1)
+                await browser_service.open_login_window(acc_id)
+                print(f"✓ [Background] Browser window opened for account: {acc_id}.")
+            except Exception as e:
+                print(f"⚠ [Background] Failed to open login window: {e}")
         
-        if resident_project_id:
-            # 直接启动常驻模式（会自动导航到项目页面，cookie已持久化）
-            await browser_service.start_resident_mode(resident_project_id)
-            print(f"✓ Browser captcha resident mode started (project: {resident_project_id[:8]}...)")
-        else:
-            # 没有可用的project_id时，打开登录窗口供用户手动操作
-            await browser_service.open_login_window()
-            print("⚠ No active token with project_id found, opened login window for manual setup")
+        # 啟動背景任務
+        import asyncio
+        asyncio.create_task(delayed_browser_start(account_id))
     elif captcha_config.captcha_method == "browser":
         from .services.browser_captcha import BrowserCaptchaService
         browser_service = await BrowserCaptchaService.get_instance(db)
