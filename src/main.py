@@ -95,6 +95,24 @@ async def lifespan(app: FastAPI):
         
         if not active_emails:
             active_emails.add("default")
+        
+        # [FIX] 服務重啟時先清理舊的 Chrome 進程
+        import psutil
+        browser_data_base = os.path.join(os.getcwd(), "browser_data")
+        for email in active_emails:
+            user_data_dir = os.path.join(browser_data_base, email)
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if proc.info['name'] == 'chrome.exe':
+                        cmdline = " ".join(proc.info['cmdline'] or []).lower()
+                        if user_data_dir.lower() in cmdline:
+                            print(f"⚠ 清理舊的 Chrome 進程 (PID: {proc.info['pid']}, 帳號: {email})")
+                            proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        
+        # 給 Chrome 一點時間完全關閉
+        await asyncio.sleep(1)
             
         # 預先初始化並打開登錄窗口 (改為異步背景執行，避免阻塞服務啟動)
         async def delayed_browser_start(acc_id):
