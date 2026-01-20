@@ -86,11 +86,15 @@ async def lifespan(app: FastAPI):
         browser_service = await BrowserCaptchaService.get_instance(db)
         print("✓ Browser captcha service initialized (nodriver mode)")
         
-        # 启动常驻模式：从第一个可用token获取 account_id
+        # [FIX] 启动常驻模式：为所有活躍帳號預載入瀏覽器
         tokens = await token_manager.get_all_tokens()
-        account_id = "default"
-        if tokens:
-            account_id = tokens[0].email
+        active_emails = set()
+        for t in tokens:
+            if t.is_active and t.email:
+                active_emails.add(t.email.lower())
+        
+        if not active_emails:
+            active_emails.add("default")
             
         # 預先初始化並打開登錄窗口 (改為異步背景執行，避免阻塞服務啟動)
         async def delayed_browser_start(acc_id):
@@ -100,11 +104,16 @@ async def lifespan(app: FastAPI):
                 await browser_service.open_login_window(acc_id)
                 print(f"✓ [Background] Browser window opened for account: {acc_id}.")
             except Exception as e:
-                print(f"⚠ [Background] Failed to open login window: {e}")
+                print(f"⚠ [Background] Failed to open login window for {acc_id}: {e}")
         
-        # 啟動背景任務
+        # [FIX] 為每個帳號啟動背景任務
         import asyncio
-        asyncio.create_task(delayed_browser_start(account_id))
+        for idx, email in enumerate(active_emails):
+            # 為每個帳號延遲不同時間，避免同時啟動
+            async def start_with_delay(acc_id, delay):
+                await asyncio.sleep(delay)
+                await delayed_browser_start(acc_id)
+            asyncio.create_task(start_with_delay(email, idx * 2))
     elif captcha_config.captcha_method == "browser":
         from .services.browser_captcha import BrowserCaptchaService
         browser_service = await BrowserCaptchaService.get_instance(db)
