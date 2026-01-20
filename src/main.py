@@ -158,11 +158,36 @@ async def lifespan(app: FastAPI):
 
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
 
+    # [NEW] 定时任务：每 6 小时同步一次所有 token 的余额
+    async def periodic_credit_refresh_task():
+        """定时任务：每 6 小时更新一次所有活跃 token 的额度"""
+        while True:
+            try:
+                # 初始等待 1 分鐘，避免與啟動時的視窗開啟競爭資源
+                await asyncio.sleep(60)
+                print("🔄 [Background] Starting periodic credit refresh for all tokens...")
+                tokens = await token_manager.get_all_tokens()
+                for t in tokens:
+                    if t.is_active:
+                        try:
+                            await token_manager.refresh_credits(t.id)
+                        except Exception as e:
+                            print(f"⚠ Failed to refresh credits for {t.email}: {e}")
+                
+                # 之後每 6 小時执行一次
+                await asyncio.sleep(6 * 3600)
+            except Exception as e:
+                print(f"❌ Periodic credit refresh task error: {e}")
+                await asyncio.sleep(60) # 出錯時等待一分鐘再重試
+
+    credit_refresh_task_handle = asyncio.create_task(periodic_credit_refresh_task())
+
     print(f"✓ Database initialized")
     print(f"✓ Total tokens: {len(tokens)}")
     print(f"✓ Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
     print(f"✓ File cache cleanup task started")
     print(f"✓ 429 auto-unban task started (runs every hour)")
+    print(f"✓ Periodic credit refresh task started (runs every 6 hours)")
     print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
@@ -174,9 +199,11 @@ async def lifespan(app: FastAPI):
     await generation_handler.file_cache.stop_cleanup_task()
     # Stop auto-unban task
     auto_unban_task_handle.cancel()
+    # Stop credit refresh task
+    credit_refresh_task_handle.cancel()
     try:
-        await auto_unban_task_handle
-    except asyncio.CancelledError:
+        await asyncio.gather(auto_unban_task_handle, credit_refresh_task_handle, return_exceptions=True)
+    except Exception:
         pass
     # Close browser if initialized
     if browser_service:
