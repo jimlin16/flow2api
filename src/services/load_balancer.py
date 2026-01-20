@@ -65,6 +65,11 @@ class LoadBalancer:
                 if not token.video_enabled:
                     filtered_reasons[token.id] = "视频生成已禁用"
                     continue
+                
+                # [FIX] 檢查餘額 (門檻: 20 credits)
+                if token.credits < 20:
+                    filtered_reasons[token.id] = f"餘額不足 (目前: {token.credits}, 需要: 20)"
+                    continue
 
                 # Check concurrency limit
                 if self.concurrency_manager and not await self.concurrency_manager.can_use_video(token.id):
