@@ -190,6 +190,9 @@ class BrowserCaptchaService:
                     '--window-size=1280,720',
                     '--profile-directory=Default',
                     '--start-minimized',
+                    '--disable-session-crashed-bubble',  # 禁用「Chrome 未正確關閉」對話框
+                    '--disable-infobars',  # 禁用資訊列
+                    '--hide-crash-restore-bubble',  # 隱藏恢復提示
                 ]
             )
 
