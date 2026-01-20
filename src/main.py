@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pathlib import Path
 import os
+import asyncio
 
 from .core.config import config
 from .core.database import Database
