@@ -1,5 +1,5 @@
 """API routes - OpenAI compatible endpoints"""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import List, Optional
 import base64
@@ -87,10 +87,18 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
 @router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
+    raw_request: Request,
     api_key: str = Depends(verify_api_key_header)
 ):
     """Create chat completion (unified endpoint for image and video generation)"""
     try:
+        # Extract Account ID from header
+        account_id = raw_request.headers.get("X-Account-ID")
+        if account_id:
+            # [FIX] Force lowercase to ensure case-insensitive matching
+            account_id = account_id.lower()
+            debug_logger.log_info(f"[API] Using Account ID from header: {account_id}")
+
         # Extract prompt from messages
         if not request.messages:
             raise HTTPException(status_code=400, detail="Messages cannot be empty")
@@ -181,7 +189,8 @@ async def create_chat_completion(
                     model=request.model,
                     prompt=prompt,
                     images=images if images else None,
-                    stream=True
+                    stream=True,
+                    account_id=account_id
                 ):
                     yield chunk
 
@@ -204,7 +213,8 @@ async def create_chat_completion(
                 model=request.model,
                 prompt=prompt,
                 images=images if images else None,
-                stream=False
+                stream=False,
+                account_id=account_id
             ):
                 result = chunk
 

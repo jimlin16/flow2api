@@ -7,6 +7,7 @@ import secrets
 from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import config
+from ..core.logger import debug_logger
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 
@@ -185,9 +186,26 @@ async def change_password(
 # ========== Token Management ==========
 
 @router.get("/api/tokens")
-async def get_tokens(token: str = Depends(verify_admin_token)):
+async def get_tokens(refresh: bool = False, token: str = Depends(verify_admin_token)):
     """Get all tokens with statistics"""
     tokens = await token_manager.get_all_tokens()
+    
+    # [FEATURE] Manual Real-time Refresh
+    if refresh:
+        import asyncio
+        active_tokens = [t for t in tokens if t.is_active]
+        if active_tokens:
+            debug_logger.log_info(f"[API] Manual refresh requested for {len(active_tokens)} active tokens")
+            try:
+                # Concurrently refresh all active tokens
+                tasks = [token_manager.refresh_credits(t.id) for t in active_tokens]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                # Re-fetch updated tokens
+                tokens = await token_manager.get_all_tokens()
+            except Exception as e:
+                debug_logger.log_error(f"[API] Error during manual refresh: {str(e)}")
+                # Continue with stale data rather than crashing
+
     result = []
 
     for t in tokens:

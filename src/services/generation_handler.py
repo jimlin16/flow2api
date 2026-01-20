@@ -353,7 +353,8 @@ class GenerationHandler:
         model: str,
         prompt: str,
         images: Optional[List[bytes]] = None,
-        stream: bool = False
+        stream: bool = False,
+        account_id: Optional[str] = None
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -407,10 +408,29 @@ class GenerationHandler:
         # 2. 选择Token
         debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
 
-        if generation_type == "image":
-            token = await self.load_balancer.select_token(for_image_generation=True, model=model)
+        if account_id:
+            # [FIX] Force lowercase
+            account_id = account_id.lower()
+            debug_logger.log_info(f"[GENERATION] 指定使用Account ID: {account_id}")
+            tokens = await self.token_manager.get_all_tokens()
+            # Try to match by Email (ID is email in our context) or ID
+            token = next((t for t in tokens if t.email == account_id and t.is_active), None)
+            
+            if not token:
+                # Try ID match if email match fails
+                try:
+                    target_id = int(account_id)
+                    token = next((t for t in tokens if t.id == target_id and t.is_active), None)
+                except ValueError:
+                    pass
+            
+            if not token:
+                error_msg = f"指定的 Account {account_id} 不存在或未啟用"
         else:
-            token = await self.load_balancer.select_token(for_video_generation=True, model=model)
+            if generation_type == "image":
+                token = await self.load_balancer.select_token(for_image_generation=True, model=model)
+            else:
+                token = await self.load_balancer.select_token(for_video_generation=True, model=model)
 
         if not token:
             error_msg = self._get_no_token_error_message(generation_type)
@@ -548,9 +568,10 @@ class GenerationHandler:
                 # 支持多图输入
                 for idx, image_bytes in enumerate(images):
                     media_id = await self.flow_client.upload_image(
-                        token.at,
-                        image_bytes,
-                        model_config["aspect_ratio"]
+                        at=token.at,
+                        image_bytes=image_bytes,
+                        aspect_ratio=model_config["aspect_ratio"],
+                        account_id=token.email
                     )
                     image_inputs.append({
                         "name": media_id,
@@ -569,7 +590,8 @@ class GenerationHandler:
                 prompt=prompt,
                 model_name=model_config["model_name"],
                 aspect_ratio=model_config["aspect_ratio"],
-                image_inputs=image_inputs
+                image_inputs=image_inputs,
+                account_id=token.email
             )
 
             # 提取URL
@@ -722,7 +744,7 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk("上传首帧图片...\n")
                     start_media_id = await self.flow_client.upload_image(
-                        token.at, images[0], model_config["aspect_ratio"]
+                        at=token.at, image_bytes=images[0], aspect_ratio=model_config["aspect_ratio"], account_id=token.email
                     )
                     debug_logger.log_info(f"[I2V] 仅上传首帧: {start_media_id}")
 
@@ -731,10 +753,10 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk("上传首帧和尾帧图片...\n")
                     start_media_id = await self.flow_client.upload_image(
-                        token.at, images[0], model_config["aspect_ratio"]
+                        at=token.at, image_bytes=images[0], aspect_ratio=model_config["aspect_ratio"], account_id=token.email
                     )
                     end_media_id = await self.flow_client.upload_image(
-                        token.at, images[1], model_config["aspect_ratio"]
+                        at=token.at, image_bytes=images[1], aspect_ratio=model_config["aspect_ratio"], account_id=token.email
                     )
                     debug_logger.log_info(f"[I2V] 上传首尾帧: {start_media_id}, {end_media_id}")
 
@@ -745,7 +767,7 @@ class GenerationHandler:
 
                 for idx, img in enumerate(images):  # 上传所有图片,不限制数量
                     media_id = await self.flow_client.upload_image(
-                        token.at, img, model_config["aspect_ratio"]
+                        at=token.at, image_bytes=img, aspect_ratio=model_config["aspect_ratio"], account_id=token.email
                     )
                     reference_images.append({
                         "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
@@ -756,6 +778,9 @@ class GenerationHandler:
             # ========== 调用生成API ==========
             if stream:
                 yield self._create_stream_chunk("提交视频生成任务...\n")
+
+            # [FIX] Always use lowercase token email as account_id to match browser instance
+            normalized_account_id = token.email.lower() if token.email else "default"
 
             # I2V: 首尾帧生成
             if video_type == "i2v" and start_media_id:
@@ -769,12 +794,11 @@ class GenerationHandler:
                         aspect_ratio=model_config["aspect_ratio"],
                         start_media_id=start_media_id,
                         end_media_id=end_media_id,
-                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE",
+                        account_id=normalized_account_id
                     )
                 else:
-                    # 只有首帧 - 需要将 model_key 中的 _fl_ 替换为 _
-                    # 例如: veo_3_1_i2v_s_fast_fl_ultra_relaxed -> veo_3_1_i2v_s_fast_ultra_relaxed
-                    #       veo_3_1_i2v_s_fast_portrait_fl_ultra_relaxed -> veo_3_1_i2v_s_fast_portrait_ultra_relaxed
+                    # 只有首帧
                     actual_model_key = model_config["model_key"].replace("_fl_", "_")
                     debug_logger.log_info(f"[I2V] 单帧模式，model_key: {model_config['model_key']} -> {actual_model_key}")
                     result = await self.flow_client.generate_video_start_image(
@@ -784,7 +808,8 @@ class GenerationHandler:
                         model_key=actual_model_key,
                         aspect_ratio=model_config["aspect_ratio"],
                         start_media_id=start_media_id,
-                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE",
+                        account_id=normalized_account_id
                     )
 
             # R2V: 多图生成
@@ -796,7 +821,8 @@ class GenerationHandler:
                     model_key=model_config["model_key"],
                     aspect_ratio=model_config["aspect_ratio"],
                     reference_images=reference_images,
-                    user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+                    user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE",
+                    account_id=normalized_account_id
                 )
 
             # T2V 或 R2V无图: 纯文本生成
@@ -807,7 +833,8 @@ class GenerationHandler:
                     prompt=prompt,
                     model_key=model_config["model_key"],
                     aspect_ratio=model_config["aspect_ratio"],
-                    user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+                    user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE",
+                    account_id=normalized_account_id
                 )
 
             # 获取task_id和operations
@@ -858,7 +885,11 @@ class GenerationHandler:
             await asyncio.sleep(poll_interval)
 
             try:
-                result = await self.flow_client.check_video_status(token.at, operations)
+                result = await self.flow_client.check_video_status(
+                    at=token.at, 
+                    operations=operations,
+                    account_id=token.email
+                )
                 checked_operations = result.get("operations", [])
 
                 if not checked_operations:

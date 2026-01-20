@@ -284,7 +284,7 @@ class TokenManager:
                 return False
 
             # 第一次尝试刷新 AT
-            result = await self._do_refresh_at(token_id, token.st)
+            result = await self._do_refresh_at(token_id, token.st, account_id=token.email)
             if result:
                 return True
 
@@ -295,7 +295,7 @@ class TokenManager:
             if new_st:
                 # ST 更新成功，重试 AT 刷新
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST 已更新，重试 AT 刷新...")
-                result = await self._do_refresh_at(token_id, new_st)
+                result = await self._do_refresh_at(token_id, new_st, account_id=token.email)
                 if result:
                     return True
 
@@ -304,7 +304,7 @@ class TokenManager:
             await self.disable_token(token_id)
             return False
 
-    async def _do_refresh_at(self, token_id: int, st: str) -> bool:
+    async def _do_refresh_at(self, token_id: int, st: str, account_id: Optional[str] = None) -> bool:
         """执行 AT 刷新的核心逻辑
 
         Args:
@@ -318,7 +318,7 @@ class TokenManager:
             debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 开始刷新AT...")
 
             # 使用ST转AT
-            result = await self.flow_client.st_to_at(st)
+            result = await self.flow_client.st_to_at(st, account_id=account_id)
             new_at = result["access_token"]
             expires = result.get("expires")
 
@@ -342,7 +342,7 @@ class TokenManager:
 
             # 验证 AT 有效性：通过 get_credits 测试
             try:
-                credits_result = await self.flow_client.get_credits(new_at)
+                credits_result = await self.flow_client.get_credits(new_at, account_id=account_id)
                 await self.db.update_token(
                     token_id,
                     credits=credits_result.get("credits", 0)
@@ -391,7 +391,8 @@ class TokenManager:
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试通过浏览器刷新 ST...")
             
             # Derive account_id from current ST
-            account_id = token.st[:16] if token.st else "default"
+            # Derive account_id from stable email if available, otherwise fallback to "default"
+            account_id = token.email if token.email else "default"
 
             from .browser_captcha_personal import BrowserCaptchaService
             service = await BrowserCaptchaService.get_instance(self.db)
@@ -432,7 +433,8 @@ class TokenManager:
         project_name = now.strftime("%b %d - %H:%M")
 
         try:
-            project_id = await self.flow_client.create_project(token.st, project_name)
+            account_id = token.email if token.email else "default"
+            project_id = await self.flow_client.create_project(token.st, project_name, account_id=account_id)
             debug_logger.log_info(f"[PROJECT] Created project for token {token_id}: {project_name}")
 
             # 更新Token
@@ -465,6 +467,14 @@ class TokenManager:
             await self.db.increment_token_stats(token_id, "video")
         else:
             await self.db.increment_token_stats(token_id, "image")
+
+        # [FIX] Immediately refresh credits from API so UI updates
+        # Don't await strictly if performance is concern, but here accuracy is preferred
+        try:
+            await self.refresh_credits(token_id)
+        except Exception as e:
+            # Don't fail the usage record just because refresh failed
+            debug_logger.log_warning(f"[USAGE] Failed to auto-refresh credits for {token_id}: {e}")
 
     async def record_error(self, token_id: int):
         """Record token error and auto-disable if threshold reached"""
@@ -567,6 +577,10 @@ class TokenManager:
     async def refresh_credits(self, token_id: int) -> int:
         """刷新Token余额
 
+        [FIX] This method now uses a lightweight AT check that does NOT trigger
+        browser automation. If the AT is expired and cannot be refreshed via API,
+        it simply returns 0 instead of opening a browser window.
+
         Returns:
             credits
         """
@@ -574,15 +588,48 @@ class TokenManager:
         if not token:
             return 0
 
-        # 确保AT有效
-        if not await self.is_at_valid(token_id):
-            return 0
+        # [FIX] Lightweight AT validity check - skip browser automation
+        # Only attempt API-based AT refresh, do NOT fall back to ST/browser refresh
+        at_to_use = token.at
+        if not at_to_use:
+            debug_logger.log_warning(f"[CREDITS_REFRESH] Token {token_id}: No AT available, skipping credit refresh")
+            return token.credits or 0
 
-        # 重新获取token (AT可能已刷新)
-        token = await self.db.get_token(token_id)
+        # Check AT expiry
+        if token.at_expires:
+            now = datetime.now(timezone.utc)
+            if token.at_expires.tzinfo is None:
+                at_expires_aware = token.at_expires.replace(tzinfo=timezone.utc)
+            else:
+                at_expires_aware = token.at_expires
 
+            time_until_expiry = at_expires_aware - now
+            if time_until_expiry.total_seconds() < 3600:  # Less than 1 hour
+                # Try to refresh AT via API only (no browser)
+                debug_logger.log_info(f"[CREDITS_REFRESH] Token {token_id}: AT expiring soon, attempting API refresh")
+                try:
+                    st = token.st
+                    if st:
+                        result = await self.flow_client.st_to_at(st, account_id=token.email)
+                        at_to_use = result["access_token"]
+                        expires = result.get("expires")
+                        new_at_expires = None
+                        if expires:
+                            try:
+                                new_at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+                            except:
+                                pass
+                        await self.db.update_token(token_id, at=at_to_use, at_expires=new_at_expires)
+                        debug_logger.log_info(f"[CREDITS_REFRESH] Token {token_id}: AT refreshed via API")
+                except Exception as e:
+                    # API refresh failed - use existing AT anyway, it might still work for credits
+                    debug_logger.log_warning(f"[CREDITS_REFRESH] Token {token_id}: API AT refresh failed: {e}, using existing AT")
+                    at_to_use = token.at
+
+        # Now try to fetch credits with the AT we have
         try:
-            result = await self.flow_client.get_credits(token.at)
+            account_id = token.email if token.email else "default"
+            result = await self.flow_client.get_credits(at_to_use, account_id=account_id)
             credits = result.get("credits", 0)
 
             # 更新数据库
@@ -591,4 +638,4 @@ class TokenManager:
             return credits
         except Exception as e:
             debug_logger.log_error(f"Failed to refresh credits for token {token_id}: {str(e)}")
-            return 0
+            return token.credits or 0

@@ -35,6 +35,9 @@ class FlowClient:
         if not account_id:
             account_id = f"random_{random.randint(1, 999999)}"
         
+        # [FIX] Force lowercase
+        account_id = account_id.lower()
+
         # 如果已缓存，直接返回
         if account_id in self._user_agent_cache:
             return self._user_agent_cache[account_id]
@@ -123,7 +126,8 @@ class FlowClient:
         use_st: bool = False,
         st_token: Optional[str] = None,
         use_at: bool = False,
-        at_token: Optional[str] = None
+        at_token: Optional[str] = None,
+        account_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """统一HTTP请求处理"""
         proxy_url = await self.proxy_manager.get_proxy_url()
@@ -140,16 +144,19 @@ class FlowClient:
             headers["authorization"] = f"Bearer {at_token}"
 
         # 确定账号标识
-        account_id = None
-        if st_token:
-            account_id = st_token[:16]
-        elif at_token:
-            account_id = at_token[:16]
+        # 1. 优先使用传入的 account_id (通常是 email)
+        # 2. 其次尝试从 token 中截取 (不推荐，不稳定)
+        final_account_id = account_id
+        if not final_account_id:
+            if st_token:
+                final_account_id = st_token[:16]
+            elif at_token:
+                final_account_id = at_token[:16]
 
         # 通用请求头
         headers.update({
             "Content-Type": "application/json",
-            "User-Agent": await self._generate_user_agent(account_id)
+            "User-Agent": await self._generate_user_agent(final_account_id)
         })
 
         # Log request
@@ -216,20 +223,21 @@ class FlowClient:
 
     # ========== 认证相关 (使用ST) ==========
 
-    async def st_to_at(self, st: str) -> dict:
+    async def st_to_at(self, st: str, account_id: Optional[str] = None) -> dict:
         """ST转AT"""
         url = f"{self.labs_base_url}/auth/session"
         result = await self._make_request(
             method="GET",
             url=url,
             use_st=True,
-            st_token=st
+            st_token=st,
+            account_id=account_id
         )
         return result
 
     # ========== 项目管理 (使用ST) ==========
 
-    async def create_project(self, st: str, title: str) -> str:
+    async def create_project(self, st: str, title: str, account_id: Optional[str] = None) -> str:
         """创建项目,返回project_id"""
         url = f"{self.labs_base_url}/trpc/project.createProject"
         json_data = {
@@ -244,13 +252,14 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_st=True,
-            st_token=st
+            st_token=st,
+            account_id=account_id
         )
 
         project_id = result["result"]["data"]["json"]["result"]["projectId"]
         return project_id
 
-    async def delete_project(self, st: str, project_id: str):
+    async def delete_project(self, st: str, project_id: str, account_id: Optional[str] = None):
         """删除项目"""
         url = f"{self.labs_base_url}/trpc/project.deleteProject"
         json_data = {
@@ -264,19 +273,21 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_st=True,
-            st_token=st
+            st_token=st,
+            account_id=account_id
         )
 
     # ========== 余额查询 (使用AT) ==========
 
-    async def get_credits(self, at: str) -> dict:
+    async def get_credits(self, at: str, account_id: Optional[str] = None) -> dict:
         """查询余额"""
         url = f"{self.api_base_url}/credits"
         result = await self._make_request(
             method="GET",
             url=url,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_id=account_id
         )
         return result
 
@@ -286,7 +297,8 @@ class FlowClient:
         self,
         at: str,
         image_bytes: bytes,
-        aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE"
+        aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE",
+        account_id: Optional[str] = None
     ) -> str:
         """上传图片,返回mediaGenerationId"""
         if aspect_ratio.startswith("VIDEO_"):
@@ -313,7 +325,8 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_id=account_id
         )
 
         media_id = result["mediaGenerationId"]["mediaGenerationId"]
@@ -328,13 +341,15 @@ class FlowClient:
         prompt: str,
         model_name: str,
         aspect_ratio: str,
-        image_inputs: Optional[List[Dict]] = None
+        image_inputs: Optional[List[Dict]] = None,
+        account_id: Optional[str] = None
     ) -> dict:
         """生成图片(同步返回)"""
         url = f"{self.api_base_url}/projects/{project_id}/flowMedia:batchGenerateImages"
 
-        account_id = at[:16] if at else "default"
-        recaptcha_token = await self._get_recaptcha_token(project_id, account_id) or ""
+        # 使用传入的 account_id，若无则回退到 token 前缀
+        final_account_id = account_id if account_id else (at[:16] if at else "default")
+        recaptcha_token = await self._get_recaptcha_token(project_id, final_account_id) or ""
         session_id = self._generate_session_id()
 
         request_data = {
@@ -364,7 +379,8 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_id=account_id
         )
 
         return result
@@ -378,13 +394,14 @@ class FlowClient:
         prompt: str,
         model_key: str,
         aspect_ratio: str,
-        user_paygate_tier: str = "PAYGATE_TIER_ONE"
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        account_id: Optional[str] = None
     ) -> dict:
         """文生视频,返回task_id"""
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoText"
 
-        account_id = at[:16] if at else "default"
-        recaptcha_token = await self._get_recaptcha_token(project_id, account_id) or ""
+        final_account_id = account_id if account_id else (at[:16] if at else "default")
+        recaptcha_token = await self._get_recaptcha_token(project_id, final_account_id) or ""
         session_id = self._generate_session_id()
         scene_id = str(uuid.uuid4())
 
@@ -414,7 +431,8 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_id=account_id
         )
         return result
 
@@ -427,13 +445,14 @@ class FlowClient:
         aspect_ratio: str,
         start_media_id: str,
         end_media_id: str,
-        user_paygate_tier: str = "PAYGATE_TIER_ONE"
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        account_id: Optional[str] = None
     ) -> dict:
         """首尾帧视频生成 (I2V)"""
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoText"
 
-        account_id = at[:16] if at else "default"
-        recaptcha_token = await self._get_recaptcha_token(project_id, account_id) or ""
+        final_account_id = account_id if account_id else (at[:16] if at else "default")
+        recaptcha_token = await self._get_recaptcha_token(project_id, final_account_id) or ""
         session_id = self._generate_session_id()
         scene_id = str(uuid.uuid4())
 
@@ -473,7 +492,8 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_id=account_id
         )
         return result
 
@@ -485,13 +505,14 @@ class FlowClient:
         model_key: str,
         aspect_ratio: str,
         start_media_id: str,
-        user_paygate_tier: str = "PAYGATE_TIER_ONE"
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        account_id: Optional[str] = None
     ) -> dict:
         """单帧视频生成 (I2V)"""
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoText"
 
-        account_id = at[:16] if at else "default"
-        recaptcha_token = await self._get_recaptcha_token(project_id, account_id) or ""
+        final_account_id = account_id if account_id else (at[:16] if at else "default")
+        recaptcha_token = await self._get_recaptcha_token(project_id, final_account_id) or ""
         session_id = self._generate_session_id()
         scene_id = str(uuid.uuid4())
 
@@ -527,7 +548,8 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_id=account_id
         )
         return result
 
@@ -539,13 +561,14 @@ class FlowClient:
         model_key: str,
         aspect_ratio: str,
         reference_images: List[Dict],
-        user_paygate_tier: str = "PAYGATE_TIER_ONE"
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        account_id: Optional[str] = None
     ) -> dict:
         """参考图视频生成 (R2V)"""
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoText"
 
-        account_id = at[:16] if at else "default"
-        recaptcha_token = await self._get_recaptcha_token(project_id, account_id) or ""
+        final_account_id = account_id if account_id else (at[:16] if at else "default")
+        recaptcha_token = await self._get_recaptcha_token(project_id, final_account_id) or ""
         session_id = self._generate_session_id()
         scene_id = str(uuid.uuid4())
 
@@ -576,11 +599,12 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_id=account_id
         )
         return result
 
-    async def check_video_status(self, at: str, operations: List[Dict]) -> dict:
+    async def check_video_status(self, at: str, operations: List[Dict], account_id: Optional[str] = None) -> dict:
         """查询视频生成状态"""
         url = f"{self.api_base_url}/video:batchCheckAsyncVideoGenerationStatus"
 
@@ -593,7 +617,8 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_id=account_id
         )
 
         return result

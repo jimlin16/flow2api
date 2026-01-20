@@ -60,72 +60,122 @@ class BrowserCaptchaService:
         return cls._instance
 
     async def get_user_agent(self, account_id: str = "default") -> str:
-        """获取当前浏览器的 User-Agent"""
-        await self.initialize_for_account(account_id)
+        """获取当前浏览器的 User-Agent
+        
+        [FIX] This method NO LONGER triggers browser initialization.
+        It only returns a UA if the browser instance already exists.
+        """
+        account_id = account_id.lower()
+        
+        # [FIX] Check cached UA first
+        if hasattr(self, f'_ua_{account_id}'):
+            return getattr(self, f'_ua_{account_id}')
+        
+        # [FIX] Only use browser if it ALREADY EXISTS - do NOT initialize a new one
         browser = self.browser_instances.get(account_id)
         if browser:
-            # 简单方式：通过 evaluate 获取 (nodriver browser 对象没有直接的 ua 属性，通常需要通过 tab)
-            # 我們可以嘗試從配置中獲取，或者打開一個臨時標籤頁
             try:
-                # 為了避免頻繁打開標籤頁，我們可以緩存它
-                if hasattr(self, f'_ua_{account_id}'):
-                    return getattr(self, f'_ua_{account_id}')
-                
                 # 由於獲取 UA 需要一個 tab，如果已經有常駐 tab，用它
-                project_id = self.get_resident_project_id(account_id)
-                if project_id:
-                     resident_info = self._account_resident_tabs[account_id][project_id]
-                     if resident_info and resident_info.tab:
-                         ua = await resident_info.tab.evaluate("navigator.userAgent")
-                         setattr(self, f'_ua_{account_id}', ua)
-                         return ua
+                if account_id in self._account_resident_tabs:
+                    for project_id, resident_info in self._account_resident_tabs[account_id].items():
+                        if resident_info and resident_info.tab:
+                            ua = await resident_info.tab.evaluate("navigator.userAgent")
+                            setattr(self, f'_ua_{account_id}', ua)
+                            return ua
                 
-                # 否則新建一個 (這可能會慢一點)
-                tab = await browser.get("about:blank", new_tab=True)
-                ua = await tab.evaluate("navigator.userAgent")
-                await tab.close()
-                setattr(self, f'_ua_{account_id}', ua)
-                return ua
+                # Try main_tab if no resident tab
+                if hasattr(browser, 'main_tab') and browser.main_tab:
+                    ua = await browser.main_tab.evaluate("navigator.userAgent")
+                    setattr(self, f'_ua_{account_id}', ua)
+                    return ua
+                    
             except Exception as e:
-                debug_logger.log_warning(f"Failed to get UA from browser: {e}")
+                debug_logger.log_warning(f"Failed to get UA from existing browser: {e}")
                 
+        # [FIX] Return fallback UA without opening any browser
         return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    async def initialize_for_account(self, account_id: str):
-        """為特定帳號初始化 nodriver 瀏覽器"""
-        if account_id in self.browser_instances:
-            browser = self.browser_instances[account_id]
-            # 检查浏览器是否仍然存活
+    async def initialize_for_account(self, account_id: str, create_if_missing: bool = True):
+        """為特定帳號初始化 nodriver 瀏覽器
+        
+        [FUNDAMENTAL GUARD] This function now ALWAYS checks if a Chrome process 
+        is already running for this profile FIRST, before doing anything else.
+        This prevents duplicate browser windows from ANY code path.
+        
+        Args:
+            account_id: The account identifier (email)
+            create_if_missing: If False, will NOT create a new browser if none exists.
+                              This is useful for read-only operations that shouldn't
+                              trigger browser initialization.
+        """
+        # [FIX] Force lowercase
+        account_id = account_id.lower()
+        user_data_dir = os.path.join(os.getcwd(), "browser_data", account_id)
+        
+        # ============================================================
+        # FUNDAMENTAL GUARD: Check Chrome process status FIRST
+        # This runs regardless of whether we have a nodriver instance
+        # ============================================================
+        import psutil
+        chrome_pid = None
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
-                # 尝试获取浏览器信息验证存活
-                if browser.stopped:
-                    debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 瀏覽器已停止，重新初始化...")
-                    del self.browser_instances[account_id] # 清理旧的实例
-                else:
-                    return # 浏览器仍然存活，无需重新初始化
-            except Exception:
-                debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 瀏覽器無響應，重新初始化...")
-                del self.browser_instances[account_id] # 清理旧的实例
-
+                if proc.info['name'] == 'chrome.exe':
+                    cmdline = " ".join(proc.info['cmdline'] or []).lower()
+                    if user_data_dir.lower() in cmdline:
+                        chrome_pid = proc.info['pid']
+                        break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        
+        if chrome_pid:
+            # Chrome is ALREADY running for this account
+            debug_logger.log_info(f"[BrowserCaptcha] ✓ 帳號 [{account_id}] Chrome 進程已存在 (PID: {chrome_pid})，不會開新視窗")
+            
+            # If we have a nodriver instance, check if it's still valid
+            if account_id in self.browser_instances:
+                browser = self.browser_instances[account_id]
+                try:
+                    if not browser.stopped:
+                        return  # All good, reuse existing instance
+                except Exception:
+                    pass  # Instance might be broken but Chrome is running
+                    
+                # nodriver instance is broken but Chrome is running
+                # We could try to reconnect here in the future
+                # For now, just return - the existing Chrome is fine
+                debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] nodriver 連線可能斷開，但 Chrome 進程存在，保持現狀")
+            else:
+                # Chrome is running but we don't have a nodriver instance
+                # This can happen after a service restart
+                # We should NOT create a new browser - just note this situation
+                debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] Chrome 進程存在 (PID: {chrome_pid}) 但無 nodriver 實例")
+            
+            # Either way, don't create a new browser
+            return
+        
+        # ============================================================
+        # No Chrome running for this account
+        # ============================================================
+        
+        # Clean up any stale nodriver instance
+        if account_id in self.browser_instances:
+            debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] Chrome 已關閉，清理舊的 nodriver 實例")
+            del self.browser_instances[account_id]
+        
+        # Check if we should create a new browser
+        if not create_if_missing:
+            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 無瀏覽器且 create_if_missing=False，跳過初始化")
+            return
+        
+        # ============================================================
+        # Create new browser (only reaches here if Chrome not running)
+        # ============================================================
         try:
-            user_data_dir = os.path.join(os.getcwd(), "browser_data", account_id)
             debug_logger.log_info(f"[BrowserCaptcha] 正在啟動 nodriver 瀏覽器 (帳號: {account_id}, 目錄: {user_data_dir})...")
 
             # 確保 user_data_dir 存在
             os.makedirs(user_data_dir, exist_ok=True)
-
-            # [清理性優化] 啟動前先檢查並殺失掉可能殘留的相同 Profile 瀏覽器進程
-            import psutil
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    if proc.info['name'] == 'chrome.exe':
-                        cmdline = " ".join(proc.info['cmdline'] or []).lower()
-                        # 如果命令行包含當前帳號的 profile 目錄，則將其殺掉
-                        if user_data_dir.lower() in cmdline:
-                            debug_logger.log_info(f"[BrowserCaptcha] 發現殘留進程 (PID: {proc.info['pid']})，正在清理...")
-                            proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
 
             # 啟動 nodriver 瀏覽器
             browser = await uc.start(
@@ -145,6 +195,15 @@ class BrowserCaptchaService:
 
             self.browser_instances[account_id] = browser
             debug_logger.log_info(f"[BrowserCaptcha] ✅ 帳號 [{account_id}] 的 nodriver 瀏覽器已啟動")
+
+            # [FIX] 啟動時立即緩存 User-Agent，避免後續請求為了獲取 UA 而額外開窗
+            try:
+                # 使用主標籤頁獲取 UA
+                ua = await browser.main_tab.evaluate("navigator.userAgent")
+                setattr(self, f'_ua_{account_id}', ua)
+                debug_logger.log_info(f"[BrowserCaptcha] User-Agent 已緩存: {ua[:30]}...")
+            except Exception as e:
+                debug_logger.log_warning(f"[BrowserCaptcha] 啟動時緩存 UA 失敗: {e}")
 
             # 啟動看門狗監控
             if account_id not in self._watchdog_tasks or self._watchdog_tasks[account_id].done():
@@ -324,6 +383,9 @@ class BrowserCaptchaService:
         Returns:
             reCAPTCHA token字符串，如果获取失败返回None
         """
+        # [FIX] Force lowercase
+        account_id = account_id.lower()
+        
         # 确保浏览器已初始化
         await self.initialize_for_account(account_id)
         browser = self.browser_instances[account_id]
@@ -550,6 +612,7 @@ class BrowserCaptchaService:
 
     async def open_login_window(self, account_id: str = "default"):
         """打开登录窗口供用户手动登录 Google"""
+        account_id = account_id.lower()
         await self.initialize_for_account(account_id)
         browser = self.browser_instances[account_id]
         tab = await browser.get("https://accounts.google.com/")
@@ -559,6 +622,7 @@ class BrowserCaptchaService:
 
     async def refresh_session_token(self, project_id: str, account_id: str = "default") -> Optional[str]:
         """从常驻标签页获取最新的 Session Token"""
+        account_id = account_id.lower()
         # 确保浏览器已初始化
         await self.initialize_for_account(account_id)
         browser = self.browser_instances[account_id]
