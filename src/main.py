@@ -127,7 +127,6 @@ async def lifespan(app: FastAPI):
                 print(f"⚠ [Background] Failed to open login window for {acc_id}: {e}")
         
         # [FIX] 為每個帳號啟動背景任務
-        import asyncio
         for idx, email in enumerate(active_emails):
             # 為每個帳號延遲不同時間，避免同時啟動
             async def start_with_delay(acc_id, delay):
@@ -148,7 +147,6 @@ async def lifespan(app: FastAPI):
     await generation_handler.file_cache.start_cleanup_task()
 
     # Start 429 auto-unban task
-    import asyncio
     async def auto_unban_task():
         """定时任务：每小时检查并解禁429被禁用的token"""
         while True:
