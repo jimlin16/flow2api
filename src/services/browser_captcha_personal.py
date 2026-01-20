@@ -9,6 +9,7 @@ import os
 from typing import Optional
 
 import nodriver as uc
+from nodriver import cdp
 from typing import Optional, Any, List, Dict
 
 from ..core.logger import debug_logger
@@ -198,6 +199,18 @@ class BrowserCaptchaService:
 
             self.browser_instances[account_id] = browser
             debug_logger.log_info(f"[BrowserCaptcha] ✅ 帳號 [{account_id}] 的 nodriver 瀏覽器已啟動")
+
+            # [FIX] 程式化最小化視窗
+            try:
+                # 使用 CDP 命令最小化視窗
+                window_id = await browser.main_tab.send(cdp.browser.get_window_for_target())
+                await browser.main_tab.send(cdp.browser.set_window_bounds(
+                    window_id=window_id.window_id,
+                    bounds=cdp.browser.Bounds(window_state=cdp.browser.WindowState.MINIMIZED)
+                ))
+                debug_logger.log_info(f"[BrowserCaptcha] 視窗已最小化")
+            except Exception as e:
+                debug_logger.log_warning(f"[BrowserCaptcha] 最小化視窗失敗: {e}")
 
             # [FIX] 啟動時立即緩存 User-Agent，避免後續請求為了獲取 UA 而額外開窗
             try:
