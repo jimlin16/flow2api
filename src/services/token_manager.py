@@ -639,3 +639,22 @@ class TokenManager:
         except Exception as e:
             debug_logger.log_error(f"Failed to refresh credits for token {token_id}: {str(e)}")
             return token.credits or 0
+
+    async def proactive_refresh_all_st(self):
+        """主動刷新所有活躍帳號的 Session Token (ST)
+        
+        遍歷所有活躍帳號，並通過瀏覽器採樣最新的 __Secure-next-auth.session-token
+        """
+        debug_logger.log_info("[ST_PROACTIVE] 開始執行全域 ST 主動刷新採樣...")
+        tokens = await self.get_all_tokens()
+        
+        for t in tokens:
+            if not t.is_active or not t.current_project_id:
+                continue
+                
+            try:
+                # 調用現有的 _try_refresh_st 邏輯，它會通過 BrowserCaptchaService 採樣 cookie
+                # [NOTE] _try_refresh_st 內部會判斷 new_st != token.st 才更新資料庫
+                await self._try_refresh_st(t.id, t)
+            except Exception as e:
+                debug_logger.log_error(f"[ST_PROACTIVE] 帳號 [{t.email}] 刷新失敗: {e}")

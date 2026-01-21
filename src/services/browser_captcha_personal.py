@@ -130,30 +130,28 @@ class BrowserCaptchaService:
                 pass
         
         if chrome_pid:
-            # Chrome is ALREADY running for this account
-            debug_logger.log_info(f"[BrowserCaptcha] ✓ 帳號 [{account_id}] Chrome 進程已存在 (PID: {chrome_pid})，不會開新視窗")
-            
-            # If we have a nodriver instance, check if it's still valid
+            # Check if we already have a nodriver handle for this PID
             if account_id in self.browser_instances:
                 browser = self.browser_instances[account_id]
                 try:
                     if not browser.stopped:
+                        debug_logger.log_info(f"[BrowserCaptcha] ✓ 帳號 [{account_id}] Chrome 進程已存在且已受控 (PID: {chrome_pid})")
                         return  # All good, reuse existing instance
                 except Exception:
-                    pass  # Instance might be broken but Chrome is running
-                    
-                # nodriver instance is broken but Chrome is running
-                # We could try to reconnect here in the future
-                # For now, just return - the existing Chrome is fine
-                debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] nodriver 連線可能斷開，但 Chrome 進程存在，保持現狀")
-            else:
-                # Chrome is running but we don't have a nodriver instance
-                # This can happen after a service restart
-                # We should NOT create a new browser - just note this situation
-                debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] Chrome 進程存在 (PID: {chrome_pid}) 但無 nodriver 實例")
+                    pass
             
-            # Either way, don't create a new browser
-            return
+            # If we reach here, we have a Chrome process but NO controlled nodriver instance
+            # This is likely a zombie from a previous session or a manual launch
+            debug_logger.log_warning(f"[BrowserCaptcha] ⚠ 帳號 [{account_id}] 檢測到不受控的 Chrome 進程 (PID: {chrome_pid})，準備清理並重啟")
+            try:
+                p = psutil.Process(chrome_pid)
+                p.kill()
+                await asyncio.sleep(1) # Wait for exit
+                chrome_pid = None # Clear it so we proceed to start
+            except Exception as e:
+                debug_logger.log_error(f"[BrowserCaptcha] ❌ 無法清理舊進程 {chrome_pid}: {e}")
+                if not create_if_missing:
+                    return
         
         # ============================================================
         # No Chrome running for this account
@@ -189,6 +187,7 @@ class BrowserCaptchaService:
                     '--disable-setuid-sandbox',
                     '--disable-gpu',
                     '--window-size=1280,720',
+                    '--window-position=-2000,-2000', # [FIX] 將視窗推到螢幕外，防止閃爍
                     '--profile-directory=Default',
                     '--start-minimized',
                     '--disable-session-crashed-bubble',  # 禁用「Chrome 未正確關閉」對話框
@@ -625,6 +624,38 @@ class BrowserCaptchaService:
                 browser.stop()
             except Exception:
                 pass
+
+    async def keep_alive_all_tabs(self):
+        """主動對所有常駐標籤頁進行刷新，防止 Session 被 Google 判定為閒置"""
+        debug_logger.log_info("[BrowserCaptcha] 正在執行全域標籤頁保活 (Keep-Alive)...")
+        async with self._resident_lock:
+            for account_id, projects in self._account_resident_tabs.items():
+                for project_id, resident_info in projects.items():
+                    if resident_info and resident_info.tab:
+                        try:
+                            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 刷新 project_id={project_id} 標籤頁...")
+                            await resident_info.tab.reload()
+                            # [FIX] 刷新後立即強制最小化，防止它跳到前景
+                            await self._minimize_window(account_id)
+                            # 隨機等待 1-3 秒，模擬人為操作感
+                            await asyncio.sleep(1 + (time.time() % 2))
+                        except Exception as e:
+                            debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 保活刷新失敗: {e}")
+
+    async def _minimize_window(self, account_id: str):
+        """強制最小化特定帳號的瀏覽器視窗"""
+        browser = self.browser_instances.get(account_id)
+        if not browser:
+            return
+        try:
+            # 使用 CDP 命令強制最小化
+            window_id = await browser.main_tab.send(cdp.browser.get_window_for_target())
+            await browser.main_tab.send(cdp.browser.set_window_bounds(
+                window_id=window_id.window_id,
+                bounds=cdp.browser.Bounds(window_state=cdp.browser.WindowState.MINIMIZED)
+            ))
+        except Exception:
+            pass
 
     async def open_login_window(self, account_id: str = "default"):
         """打开登录窗口供用户手动登录 Google"""

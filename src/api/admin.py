@@ -232,6 +232,7 @@ async def get_tokens(refresh: bool = False, token: str = Depends(verify_admin_to
             "video_enabled": t.video_enabled,
             "image_concurrency": t.image_concurrency,
             "video_concurrency": t.video_concurrency,
+            "ban_reason": t.ban_reason,  # 🆕 禁用原因
             "image_count": stats.image_count if stats else 0,
             "video_count": stats.video_count if stats else 0,
             "error_count": stats.error_count if stats else 0

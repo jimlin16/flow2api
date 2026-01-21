@@ -119,8 +119,6 @@ async def lifespan(app: FastAPI):
         # 預先初始化並打開登錄窗口 (改為異步背景執行，避免阻塞服務啟動)
         async def delayed_browser_start(acc_id):
             try:
-                # 給予系統一點緩衝時間
-                await asyncio.sleep(1)
                 await browser_service.open_login_window(acc_id)
                 print(f"✓ [Background] Browser window opened for account: {acc_id}.")
             except Exception as e:
@@ -128,11 +126,11 @@ async def lifespan(app: FastAPI):
         
         # [FIX] 為每個帳號啟動背景任務
         for idx, email in enumerate(active_emails):
-            # 為每個帳號延遲不同時間，避免同時啟動
+            # 為每個帳號延遲不同時間，避免同時啟動 (間隔 1 秒)
             async def start_with_delay(acc_id, delay):
                 await asyncio.sleep(delay)
                 await delayed_browser_start(acc_id)
-            asyncio.create_task(start_with_delay(email, idx * 2))
+            asyncio.create_task(start_with_delay(email, idx * 1))
     elif captcha_config.captcha_method == "browser":
         from .services.browser_captcha import BrowserCaptchaService
         browser_service = await BrowserCaptchaService.get_instance(db)
@@ -158,14 +156,30 @@ async def lifespan(app: FastAPI):
 
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
 
-    # [NEW] 定时任务：每 6 小时同步一次所有 token 的余额
+    # [MODIFIED] 定时任务：每 1 小时同步一次所有 token 的餘額與 ST
     async def periodic_credit_refresh_task():
-        """定时任务：每 6 小时更新一次所有活跃 token 的额度"""
+        """定时任务：每 1 小时更新一次所有活跃 token 的额度，並主動刷新 ST 採樣"""
         while True:
             try:
                 # 初始等待 1 分鐘，避免與啟動時的視窗開啟競爭資源
                 await asyncio.sleep(60)
-                print("🔄 [Background] Starting periodic credit refresh for all tokens...")
+                
+                # 1. 執行標籤頁保活 (刷新頁面)
+                if browser_service:
+                    try:
+                        await browser_service.keep_alive_all_tabs()
+                    except Exception as e:
+                        print(f"⚠ Keep-alive failed: {e}")
+
+                print("🔄 [Background] Starting hourly credit and ST refresh...")
+                
+                # 2. 主動刷新 ST (從瀏覽器採樣最新 Cookie)
+                try:
+                    await token_manager.proactive_refresh_all_st()
+                except Exception as e:
+                    print(f"⚠ Proactive ST refresh failed: {e}")
+
+                # 3. 刷新餘額 (輕量級 API 調用)
                 tokens = await token_manager.get_all_tokens()
                 for t in tokens:
                     if t.is_active:
@@ -174,10 +188,10 @@ async def lifespan(app: FastAPI):
                         except Exception as e:
                             print(f"⚠ Failed to refresh credits for {t.email}: {e}")
                 
-                # 之後每 6 小時执行一次
-                await asyncio.sleep(6 * 3600)
+                # 每 1 小時執行一次
+                await asyncio.sleep(3600)
             except Exception as e:
-                print(f"❌ Periodic credit refresh task error: {e}")
+                print(f"❌ Periodic background task error: {e}")
                 await asyncio.sleep(60) # 出錯時等待一分鐘再重試
 
     credit_refresh_task_handle = asyncio.create_task(periodic_credit_refresh_task())
