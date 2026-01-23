@@ -32,8 +32,26 @@ class TokenManager:
         return await self.db.get_token(token_id)
 
     async def delete_token(self, token_id: int):
-        """Delete token"""
+        """Delete token and related data"""
+        # [FIX] 先獲取 Token 資訊，以便稍後清理瀏覽器
+        token = await self.get_token(token_id)
+        email = token.email if token else None
+
         await self.db.delete_token(token_id)
+
+        # [FIX] 如果沒有其他活躍 Token 使用該 Email，則關閉瀏覽器實例
+        if email:
+            all_tokens = await self.get_all_tokens()
+            # 檢查是否還有任何 Token（包括不活躍的）指向該 email
+            # 如果完全沒有了，清理 browser 進程
+            if not any(t.email and t.email.lower() == email.lower() for t in all_tokens):
+                try:
+                    from .browser_captcha_personal import BrowserCaptchaService
+                    service = await BrowserCaptchaService.get_instance(self.db)
+                    await service.stop_all_for_account(email)
+                    debug_logger.log_info(f"[DELETE] 已關閉帳號 [{email}] 的瀏覽器執行個體")
+                except Exception as e:
+                    debug_logger.log_warning(f"[DELETE] 關閉帳號 [{email}] 瀏覽器失敗: {e}")
 
     async def enable_token(self, token_id: int):
         """Enable a token and reset error count"""

@@ -98,31 +98,34 @@ async def lifespan(app: FastAPI):
         if not active_emails:
             active_emails.add("default")
         
-        # [FIX] 服務重啟時先清理舊的 Chrome 進程
+        # [FIX] 服務啟動時先清理所有關聯的 Chrome 進程，確保環境乾淨
         import psutil
-        browser_data_base = os.path.join(os.getcwd(), "browser_data")
-        for email in active_emails:
-            user_data_dir = os.path.join(browser_data_base, email)
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    if proc.info['name'] == 'chrome.exe':
-                        cmdline = " ".join(proc.info['cmdline'] or []).lower()
-                        if user_data_dir.lower() in cmdline:
-                            print(f"⚠ 清理舊的 Chrome 進程 (PID: {proc.info['pid']}, 帳號: {email})")
-                            proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+        browser_data_base = os.path.join(os.getcwd(), "browser_data").lower()
+        print(f"🔍 正在清理舊的瀏覽器進程 (基於目錄: {browser_data_base})...")
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if proc.info['name'] == 'chrome.exe':
+                    cmdline = " ".join(proc.info['cmdline'] or []).lower()
+                    if browser_data_base in cmdline:
+                        print(f"⚠ 清理殘留的 Chrome 進程 (PID: {proc.info['pid']})")
+                        proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
         
         # 給 Chrome 一點時間完全關閉
         await asyncio.sleep(1)
             
         # 預先初始化並打開登錄窗口 (改為異步背景執行，避免阻塞服務啟動)
+        print(f"🚀 正在為活躍帳號啟動瀏覽器: {active_emails}")
+
         async def delayed_browser_start(acc_id):
             try:
                 await browser_service.open_login_window(acc_id)
                 print(f"✓ [Background] Browser window opened for account: {acc_id}.")
             except Exception as e:
                 print(f"⚠ [Background] Failed to open login window for {acc_id}: {e}")
+
+        browser_service = await BrowserCaptchaService.get_instance(db)
         
         # [FIX] 為每個帳號啟動背景任務
         for idx, email in enumerate(active_emails):
