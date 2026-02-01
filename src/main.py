@@ -83,10 +83,11 @@ async def lifespan(app: FastAPI):
 
     # Initialize browser captcha service if needed
     browser_service = None
-    if captcha_config.captcha_method == "personal":
-        from .services.browser_captcha_personal import BrowserCaptchaService
-        browser_service = await BrowserCaptchaService.get_instance(db)
-        print("[OK] Browser captcha service initialized (nodriver mode)")
+    # [DISABLED] 瀏覽器打碼服務完全停用
+    # if captcha_config.captcha_method == "personal":
+    #     from .services.browser_captcha_personal import BrowserCaptchaService
+    #     browser_service = await BrowserCaptchaService.get_instance(db)
+    #     print("[OK] Browser captcha service initialized (nodriver mode)")
         
         # [DISABLED] 瀏覽器自動打碼功能暫時停用 (403 reCAPTCHA 驗證失敗)
         # 待未來整合 NopeCHA 或其他打碼服務後再啟用
