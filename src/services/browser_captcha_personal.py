@@ -419,6 +419,12 @@ class BrowserCaptchaService:
         Returns:
             Tuple[Optional[str], Optional[str]]: (reCAPTCHA token, Full Cookie String)
         """
+        # [DISABLED] 瀏覽器自動打碼功能暫時停用 (403 reCAPTCHA 驗證失敗)
+        # 待未來整合 NopeCHA 或其他打碼服務後再啟用
+        debug_logger.log_warning("[BrowserCaptcha] ⚠️ 瀏覽器打碼功能已停用，返回 None")
+        return None, None
+        
+        # --- 以下程式碼已停用 ---
         # [FIX] Force lowercase
         if not account_id: account_id = "default"
         account_id = account_id.lower()
