@@ -827,6 +827,9 @@ class GenerationHandler:
 
             # T2V 或 R2V无图: 纯文本生成
             else:
+                import sys
+                sys.stderr.write(f"\n[DEBUG] GenerationHandler calling generate_video_text for project {project_id}\n")
+                sys.stderr.flush()
                 result = await self.flow_client.generate_video_text(
                     at=token.at,
                     project_id=project_id,

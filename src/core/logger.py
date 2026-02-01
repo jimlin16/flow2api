@@ -12,6 +12,8 @@ class DebugLogger:
     def __init__(self):
         self.log_file = Path("logs.txt")
         self._setup_logger()
+        # [DEBUG] Force enable for debugging
+        config.set_debug_enabled(True)
 
     def _setup_logger(self):
         """Setup file logger"""

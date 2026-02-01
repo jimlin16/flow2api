@@ -38,13 +38,13 @@ async def lifespan(app: FastAPI):
 
     # Handle database initialization based on startup type
     if is_first_startup:
-        print("🎉 First startup detected. Initializing database and configuration from setting.toml...")
+        print("[INIT] First startup detected. Initializing database and configuration from setting.toml...")
         await db.init_config_from_toml(config_dict, is_first_startup=True)
-        print("✓ Database and configuration initialized successfully.")
+        print("[SUCCESS] Database and configuration initialized successfully.")
     else:
-        print("🔄 Existing database detected. Checking for missing tables and columns...")
+        print("[INFO] Existing database detected. Checking for missing tables and columns...")
         await db.check_and_migrate_db(config_dict)
-        print("✓ Database migration check completed.")
+        print("[SUCCESS] Database migration check completed.")
 
     # Load admin config from database
     admin_config = await db.get_admin_config()
@@ -86,7 +86,7 @@ async def lifespan(app: FastAPI):
     if captcha_config.captcha_method == "personal":
         from .services.browser_captcha_personal import BrowserCaptchaService
         browser_service = await BrowserCaptchaService.get_instance(db)
-        print("✓ Browser captcha service initialized (nodriver mode)")
+        print("[OK] Browser captcha service initialized (nodriver mode)")
         
         # [FIX] 启动常驻模式：为所有活躍帳號預載入瀏覽器
         tokens = await token_manager.get_all_tokens()
@@ -101,14 +101,18 @@ async def lifespan(app: FastAPI):
         # [FIX] 服務啟動時先清理所有關聯的 Chrome 進程，確保環境乾淨
         import psutil
         browser_data_base = os.path.join(os.getcwd(), "browser_data").lower()
-        print(f"🔍 正在清理舊的瀏覽器進程 (基於目錄: {browser_data_base})...")
+        print(f"[CLEANUP] Cleaning up old browser processes (base dir: {browser_data_base})...")
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
                 if proc.info['name'] == 'chrome.exe':
                     cmdline = " ".join(proc.info['cmdline'] or []).lower()
                     if browser_data_base in cmdline:
-                        print(f"⚠ 清理殘留的 Chrome 進程 (PID: {proc.info['pid']})")
-                        proc.kill()
+                        print(f"[WARN] Cleaning up leftover Chrome process (PID: {proc.info['pid']})")
+                        proc.terminate() # [FIX] Use terminate() for graceful shutdown to save profile data
+                        try:
+                            proc.wait(timeout=3)
+                        except psutil.TimeoutExpired:
+                            proc.kill() # Force kill if stuck
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
         
@@ -116,14 +120,14 @@ async def lifespan(app: FastAPI):
         await asyncio.sleep(1)
             
         # 預先初始化並打開登錄窗口 (改為異步背景執行，避免阻塞服務啟動)
-        print(f"🚀 正在為活躍帳號啟動瀏覽器: {active_emails}")
+        print(f"[START] Launching browsers for active accounts: {active_emails}")
 
         async def delayed_browser_start(acc_id):
             try:
                 await browser_service.open_login_window(acc_id)
-                print(f"✓ [Background] Browser window opened for account: {acc_id}.")
+                print(f"[OK] [Background] Browser window opened for account: {acc_id}.")
             except Exception as e:
-                print(f"⚠ [Background] Failed to open login window for {acc_id}: {e}")
+                print(f"[WARN] [Background] Failed to open login window for {acc_id}: {e}")
 
         browser_service = await BrowserCaptchaService.get_instance(db)
         
@@ -137,7 +141,7 @@ async def lifespan(app: FastAPI):
     elif captcha_config.captcha_method == "browser":
         from .services.browser_captcha import BrowserCaptchaService
         browser_service = await BrowserCaptchaService.get_instance(db)
-        print("✓ Browser captcha service initialized (headless mode)")
+        print("[OK] Browser captcha service initialized (headless mode)")
 
     # Initialize concurrency manager
     tokens = await token_manager.get_all_tokens()
@@ -155,7 +159,7 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(3600)  # 每小时执行一次
                 await token_manager.auto_unban_429_tokens()
             except Exception as e:
-                print(f"❌ Auto-unban task error: {e}")
+                print(f"[ERROR] Auto-unban task error: {e}")
 
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
 
@@ -172,15 +176,17 @@ async def lifespan(app: FastAPI):
                     try:
                         await browser_service.keep_alive_all_tabs()
                     except Exception as e:
-                        print(f"⚠ Keep-alive failed: {e}")
+                        print(f"[WARN] Keep-alive failed: {e}")
 
-                print("🔄 [Background] Starting hourly credit and ST refresh...")
+                print("[INFO] [Background] Starting hourly credit and ST refresh...")
                 
                 # 2. 主動刷新 ST (從瀏覽器採樣最新 Cookie)
                 try:
+                    print("[INFO] [Background] Starting proactive ST refresh sequence...")
                     await token_manager.proactive_refresh_all_st()
+                    print("[INFO] [Background] Proactive ST refresh completed.")
                 except Exception as e:
-                    print(f"⚠ Proactive ST refresh failed: {e}")
+                    print(f"[WARN] Proactive ST refresh failed: {e}")
 
                 # 3. 刷新餘額 (輕量級 API 調用)
                 tokens = await token_manager.get_all_tokens()
@@ -189,23 +195,23 @@ async def lifespan(app: FastAPI):
                         try:
                             await token_manager.refresh_credits(t.id)
                         except Exception as e:
-                            print(f"⚠ Failed to refresh credits for {t.email}: {e}")
+                            print(f"[WARN] Failed to refresh credits for {t.email}: {e}")
                 
                 # 每 1 小時執行一次
                 await asyncio.sleep(3600)
             except Exception as e:
-                print(f"❌ Periodic background task error: {e}")
+                print(f"[ERROR] Periodic background task error: {e}")
                 await asyncio.sleep(60) # 出錯時等待一分鐘再重試
 
     credit_refresh_task_handle = asyncio.create_task(periodic_credit_refresh_task())
 
-    print(f"✓ Database initialized")
-    print(f"✓ Total tokens: {len(tokens)}")
-    print(f"✓ Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
-    print(f"✓ File cache cleanup task started")
-    print(f"✓ 429 auto-unban task started (runs every hour)")
-    print(f"✓ Periodic credit refresh task started (runs every 6 hours)")
-    print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
+    print(f"[OK] Database initialized")
+    print(f"[OK] Total tokens: {len(tokens)}")
+    print(f"[OK] Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
+    print(f"[OK] File cache cleanup task started")
+    print(f"[OK] 429 auto-unban task started (runs every hour)")
+    print(f"[OK] Periodic credit refresh task started (runs every 6 hours)")
+    print(f"[OK] Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
     yield
@@ -225,9 +231,9 @@ async def lifespan(app: FastAPI):
     # Close browser if initialized
     if browser_service:
         await browser_service.close()
-        print("✓ Browser captcha service closed")
-    print("✓ File cache cleanup task stopped")
-    print("✓ 429 auto-unban task stopped")
+        print("[OK] Browser captcha service closed")
+    print("[OK] File cache cleanup task stopped")
+    print("[OK] 429 auto-unban task stopped")
 
 
 # Initialize components

@@ -5,7 +5,11 @@
 """
 import asyncio
 import time
+import random
 import os
+import sys
+import re
+import traceback
 from typing import Optional
 
 import nodriver as uc
@@ -82,12 +86,14 @@ class BrowserCaptchaService:
                         if resident_info and resident_info.tab:
                             ua = await resident_info.tab.evaluate("navigator.userAgent")
                             setattr(self, f'_ua_{account_id}', ua)
+                            debug_logger.log_info(f"[DEBUG_UA] BrowserCaptcha found Resident UA: {ua}")
                             return ua
                 
                 # Try main_tab if no resident tab
                 if hasattr(browser, 'main_tab') and browser.main_tab:
                     ua = await browser.main_tab.evaluate("navigator.userAgent")
                     setattr(self, f'_ua_{account_id}', ua)
+                    debug_logger.log_info(f"[DEBUG_UA] BrowserCaptcha found MainTab UA: {ua}")
                     return ua
                     
             except Exception as e:
@@ -187,7 +193,7 @@ class BrowserCaptchaService:
                     '--disable-setuid-sandbox',
                     '--disable-gpu',
                     '--window-size=1280,720',
-                    '--window-position=-2000,-2000', # [FIX] 將視窗推到螢幕外，防止閃爍
+                    # '--window-position=-2000,-2000', # [FIX] Remove off-screen positioning to avoid detection
                     '--profile-directory=Default',
                     '--start-minimized',
                     '--disable-session-crashed-bubble',  # 禁用「Chrome 未正確關閉」對話框
@@ -279,7 +285,7 @@ class BrowserCaptchaService:
     # start_resident_mode and stop_resident_mode are removed as per the diff,
     # as the resident mode is now managed per account/project dynamically within get_token.
 
-    async def _wait_for_recaptcha(self, tab) -> bool:
+    async def _wait_for_recaptcha(self, tab, timeout_loops: int = 20) -> bool:
         """等待 reCAPTCHA 加载
         
         Returns:
@@ -313,7 +319,7 @@ class BrowserCaptchaService:
         await tab.sleep(3)
         
         # 轮询等待 reCAPTCHA 加载
-        for i in range(20):
+        for i in range(timeout_loops):
             is_enterprise = await tab.evaluate(
                 "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'"
             )
@@ -326,15 +332,25 @@ class BrowserCaptchaService:
         debug_logger.log_warning("[BrowserCaptcha] reCAPTCHA 加载超时")
         return False
 
-    async def _execute_recaptcha_on_tab(self, tab) -> Optional[str]:
+    async def _execute_recaptcha_on_tab(self, tab, action: str = "IMAGE_GENERATION") -> Optional[str]:
+        debug_logger.log_info(f"[DEBUG_ACTION] Executing reCAPTCHA with action: {action}")
         """在指定标签页执行 reCAPTCHA 获取 token
         
         Args:
             tab: nodriver 标签页对象
+            action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
             
         Returns:
             reCAPTCHA token 或 None
         """
+        # [FIX] 移除 bring_to_front()。獲取 Token 不需要將視窗置頂，
+        # 頻繁置頂會造成使用者操作時的「跳轉」與干擾。
+        # try:
+        #     await tab.bring_to_front()
+        #     await asyncio.sleep(random.uniform(0.5, 1.5))
+        # except:
+        #     pass
+            
         # 生成唯一变量名避免冲突
         ts = int(time.time() * 1000)
         token_var = f"_recaptcha_token_{ts}"
@@ -347,13 +363,16 @@ class BrowserCaptchaService:
                 
                 try {{
                     grecaptcha.enterprise.ready(function() {{
-                        grecaptcha.enterprise.execute('{self.website_key}', {{action: 'FLOW_GENERATION'}})
-                            .then(function(token) {{
-                                window.{token_var} = token;
-                            }})
-                            .catch(function(err) {{
-                                window.{error_var} = err.message || 'execute failed';
-                            }});
+                        // 稍微延迟执行，模拟人类反应
+                        setTimeout(() => {{
+                            grecaptcha.enterprise.execute('{self.website_key}', {{action: '{action}'}})
+                                .then(function(token) {{
+                                    window.{token_var} = token;
+                                }})
+                                .catch(function(err) {{
+                                    window.{error_var} = err.message || 'execute failed';
+                                }});
+                        }}, {random.randint(100, 500)});
                     }});
                 }} catch (e) {{
                     window.{error_var} = e.message || 'exception';
@@ -364,9 +383,9 @@ class BrowserCaptchaService:
         # 注入执行脚本
         await tab.evaluate(execute_script)
         
-        # 轮询等待结果（最多 15 秒）
+        # 轮询等待结果（最多 20 秒，因为增加了延迟）
         token = None
-        for i in range(30):
+        for i in range(40):
             await tab.sleep(0.5)
             token = await tab.evaluate(f"window.{token_var}")
             if token:
@@ -386,19 +405,22 @@ class BrowserCaptchaService:
 
     # ========== 主要 API ==========
 
-    async def get_token(self, project_id: str, account_id: str = "default") -> Optional[str]:
+    async def get_token(self, project_id: str, account_id: str, action: str = "IMAGE_GENERATION", st: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
         """获取 reCAPTCHA token
         
-        自动常驻模式：如果该 project_id 没有常驻标签页，则自动创建并常驻
+        自动常驻模式：如果该 project_id 没有常駐標籤頁，則自動創建並常駐
         
         Args:
-            project_id: Flow项目ID
-            account_id: 账户ID，用于区分不同的浏览器实例和常驻标签页
+            project_id: Flow項目ID
+            account_id: 賬號標識
+            action: reCAPTCHA action類型
+            st: 選擇性的 Session Token (用於緩存失效後的注入)
 
         Returns:
-            reCAPTCHA token字符串，如果获取失败返回None
+            Tuple[Optional[str], Optional[str]]: (reCAPTCHA token, Full Cookie String)
         """
         # [FIX] Force lowercase
+        if not account_id: account_id = "default"
         account_id = account_id.lower()
         
         # 确保浏览器已初始化
@@ -414,64 +436,152 @@ class BrowserCaptchaService:
             
             # 如果该 project_id 没有常驻标签页，则自动创建
             if resident_info is None:
-                debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] project_id={project_id} 沒有常駐標籤頁，正在創建...")
-                resident_info = await self._create_resident_tab(browser, project_id)
-                if resident_info is None:
-                    debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 無法為 project_id={project_id} 創建常駐標籤頁，fallback 到傳統模式")
-                    return await self._get_token_legacy(browser, project_id, account_id)
+                debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] project_id={project_id} 沒有常駐標籤頁，正在創建唯一分頁...")
+                # 我們直接在鎖內建立對象並標記，防止併發請求開出多個分頁
+                resident_info = ResidentTabInfo(None, project_id)
                 self._account_resident_tabs[account_id][project_id] = resident_info
-                debug_logger.log_info(f"[BrowserCaptcha] ✅ 帳號 [{account_id}] 已為 project_id={project_id} 創建常駐標籤頁 (当前共 {len(self._account_resident_tabs[account_id])} 个)")
+                
+                # 在鎖內進行導航（鎖的時間會變長，但能保證唯一性）
+                try:
+                    # 如果 browser 實例還沒準備好，先確保它存在
+                    if browser is None:
+                        await self.initialize_for_account(account_id)
+                        browser = self.browser_instances[account_id]
+                    
+                    # 開始導航 (標記來源為 API_GET_TOKEN，並傳遞 ST 以備注入)
+                    success = await self._navigate_resident_tab(resident_info, browser, caller="API_GET_TOKEN", st=st)
+                    if not success:
+                        debug_logger.log_error(f"[BrowserCaptcha] 帳號 [{account_id}] 首次導航失敗")
+                        del self._account_resident_tabs[account_id][project_id]
+                        return None, None
+                except Exception as e:
+                    debug_logger.log_error(f"[BrowserCaptcha] 帳號 [{account_id}] 創建分頁異常: {e}")
+                    if project_id in self._account_resident_tabs[account_id]:
+                        del self._account_resident_tabs[account_id][project_id]
+                    return None, None
+                
+                debug_logger.log_info(f"[BrowserCaptcha] ✅ 帳號 [{account_id}] 已為 project_id={project_id} 成功創建並穩定停留")
         
         # 使用常驻标签页生成 token
-        if resident_info and resident_info.recaptcha_ready and resident_info.tab:
-            start_time = time.time()
-            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 從常駐標籤頁即時生成 token (project: {project_id})...")
-            try:
-                token = await self._execute_recaptcha_on_tab(resident_info.tab)
-                duration_ms = (time.time() - start_time) * 1000
-                if token:
-                    debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] ✅ Token生成成功（耗時 {duration_ms:.0f}ms）")
-                    return token
-                else:
-                    debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 常駐標籤頁生成失敗 (project: {project_id})，嘗試重建...")
-            except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 常駐標籤頁異常: {e}，嘗試重建...")
+        if resident_info and resident_info.tab:
+            # [FIX] 每次獲取 token 前都進行輕量級網址檢查/恢復 (Regex 比對 + Session 注入)
+            # 這能處理標籤頁在背景因 Session 過期被 Google 重定向到 [projectId] 的情況
+            await self._navigate_resident_tab(resident_info, browser, caller="API_GET_TOKEN_STABLE", st=st)
             
-            # 常駐標籤頁失效，嘗試重建
-            async with self._resident_lock:
-                await self._close_resident_tab(account_id, project_id)
-                resident_info = await self._create_resident_tab(browser, project_id)
-                if resident_info:
-                    self._account_resident_tabs[account_id][project_id] = resident_info
-                    # 重建后立即尝试生成
-                    try:
-                        token = await self._execute_recaptcha_on_tab(resident_info.tab)
-                        if token:
-                            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] ✅ 重建後 Token生成成功")
-                            return token
-                    except Exception:
-                        pass
+            start_time = time.time()
+            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 正在常駐標籤頁生成 token (project: {project_id})...")
+            try:
+                # [FIX] 鎖定在第一個分頁中執行，不再進行重建或回退，徹底避免「跳轉第二次」
+                token = await self._execute_recaptcha_on_tab(resident_info.tab, action)
+                cookies = await self._get_full_cookies(resident_info.tab)
+                
+                if token:
+                    duration_ms = (time.time() - start_time) * 1000
+                    debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] ✅ Token生成成功（耗時 {duration_ms:.0f}ms）")
+                    return token, cookies
+                else:
+                    debug_logger.log_error(f"[BrowserCaptcha] 帳號 [{account_id}] 常駐標籤頁獲取 Token 失敗 (返回空值)")
+                    return None, None
+            except Exception as e:
+                debug_logger.log_error(f"[BrowserCaptcha] 帳號 [{account_id}] 常駐分頁操作異常: {e}")
+                return None, None
         
-        # 最终 Fallback: 使用传统模式
-        debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 所有常駐方式失敗，fallback 到傳統模式 (project: {project_id})")
-        return await self._get_token_legacy(browser, project_id, account_id)
+        return None, None
+        
+        return None, None
 
-    async def _create_resident_tab(self, browser, project_id: str) -> Optional[ResidentTabInfo]:
-        """为指定 project_id 创建常驻标签页
+    async def _navigate_resident_tab(self, resident_info: ResidentTabInfo, browser, caller: str = "UNKNOWN", st: Optional[str] = None) -> bool:
+        """為指定 ResidentTabInfo 進行導航、初始化與 Session 注入
         
         Args:
-            browser: nodriver 浏览器实例
-            project_id: 项目 ID
+            resident_info: 預先分配的 ResidentTabInfo 對象
+            browser: nodriver 瀏覽器實例
+            caller: 呼叫來源標籤 (e.g., API, WATCHDOG, REFRESH)
+            st: 選配的 Session Token 用於注入注入失效的 Session
             
         Returns:
-            ResidentTabInfo 对象，或 None（创建失败）
+            bool: 是否初始化成功
         """
+        project_id = resident_info.project_id
         try:
+            sys.stderr.write(f"\n[DEBUG_TRACE] [{caller}] Entering _navigate_resident_tab. ProjectID: {project_id}\n")
+            # [REVERTED] Use project-specific URL as requested by user.
             website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
-            debug_logger.log_info(f"[BrowserCaptcha] 为 project_id={project_id} 创建常驻标签页，访问: {website_url}")
+            debug_logger.log_info(f"[BrowserCaptcha] [{caller}] 為 project_id={project_id} 導航，目標: {website_url}")
+            sys.stderr.write(f"[DEBUG_TRACE] [{caller}] Targeted URL: {website_url}\n")
             
-            # 创建新标签页
-            tab = await browser.get(website_url, new_tab=True)
+            # [FIX] 強化導航鎖定：使用正則表達式尋找已經在目標網址的分頁 (容忍語系路徑如 /zh/ /en/)
+            # 目標模式: https://labs.google/fx/(語系/)?tools/flow/project/{project_id}
+            url_pattern = f"labs\\.google/fx/(?:[a-z]{{2}}(?:-[a-z]{{2}})?/)?tools/flow/project/{re.escape(project_id)}"
+            tab = None
+            if browser.tabs:
+                for t in browser.tabs:
+                    try:
+                        curr_url = await t.evaluate("window.location.href")
+                        if re.search(url_pattern, curr_url):
+                            # [FIX] 如果匹配了網址但卻是 [projectId] 模板，代表 Session 失效，需要透過 injection 恢復
+                            if "[projectId]" in curr_url or "accounts.google.com" in curr_url:
+                                sys.stderr.write(f"[DEBUG_TRACE] [{caller}] Tab matches pattern but session EXPIRED (at {curr_url}). Skipping this tab.\n")
+                                continue
+                                
+                            tab = t
+                            sys.stderr.write(f"[DEBUG_TRACE] [{caller}] FOUND EXISTING tab matching pattern. Skipping navigation.\n")
+                            break
+                    except:
+                        continue
+                
+                if not tab:
+                    tab = browser.tabs[0]
+                    try:
+                        curr_url = await tab.evaluate("window.location.href")
+                        # 1. 檢查是否已经在正確的專案（不管是哪個語系）
+                        if re.search(url_pattern, curr_url):
+                            sys.stderr.write(f"[DEBUG_TRACE] [{caller}] Tab0 matches pattern. Skipping physical get().\n")
+                        
+                        # 2. [FIX] Session 注入：如果目前在登錄頁面或 [projectId] 模板頁面，代表 Session 失效
+                        elif "accounts.google.com" in curr_url or "[projectId]" in curr_url:
+                            sys.stderr.write(f"[DEBUG_TRACE] [{caller}] Session potentially EXPIRED (at {curr_url}).\n")
+                            
+                            if st:
+                                sys.stderr.write(f"[DEBUG_TRACE] [{caller}] [V2-CDP] Attempting SESSION INJECTION (ST found)...\n")
+                                # 注入 Cookie (針對 labs.google)
+                                # 僅對 labs.google 域名設置 __Secure-next-auth.session-token
+                                try:
+                                    # [FIX] 改用底層 CDP 指令設置 Cookie，避開版本不相容問題
+                                    from nodriver import cdp
+                                    await tab.send(cdp.network.set_cookie(
+                                        name="__Secure-next-auth.session-token",
+                                        value=st,
+                                        domain="labs.google",
+                                        path="/",
+                                        secure=True,
+                                        http_only=True
+                                    ))
+                                    # [FIX] 增加緩衝時間，確保 Cookie 注入生效
+                                    await asyncio.sleep(1)
+                                    sys.stderr.write(f"[DEBUG_TRACE] [{caller}] Injection done. Navigating to Project UUID: {website_url}\n")
+                                    await tab.get(website_url)
+                                except Exception as e_inj:
+                                    sys.stderr.write(f"[DEBUG_TRACE] [{caller}] Injection FAILED: {e_inj}. Falling back to normal nav.\n")
+                                    await tab.get(website_url)
+                            else:
+                                # 無 ST 可用，跳轉到儀表板引導手動登錄或防止死循環
+                                sys.stderr.write(f"[DEBUG_TRACE] [{caller}] NO ST available for injection. Falling back to Dashboard.\n")
+                                await tab.get("https://labs.google/fx/tools/flow")
+                        
+                        # 3. 其他網址不匹配，正常導航
+                        else:
+                            sys.stderr.write(f"[DEBUG_TRACE] [{caller}] URL MISMATCH! Current: {curr_url}. Navigating to: {website_url}\n")
+                            await tab.get(website_url)
+                    except Exception as e:
+                        sys.stderr.write(f"[DEBUG_TRACE] [{caller}] Evaluate URL failed, forcing nav: {e}\n")
+                        await tab.get(website_url)
+            else:
+                sys.stderr.write(f"[DEBUG_TRACE] [{caller}] Opening NEW tab for: {website_url}\n")
+                tab = await browser.get(website_url, new_tab=True)
+            
+            resident_info.tab = tab
+            sys.stderr.write(f"[DEBUG_TRACE] Waiting for load...\n")
             
             # 等待页面加载完成
             page_loaded = False
@@ -481,43 +591,59 @@ class BrowserCaptchaService:
                     ready_state = await tab.evaluate("document.readyState")
                     if ready_state == "complete":
                         page_loaded = True
+                        sys.stderr.write(f"[DEBUG_TRACE] Page loaded (retry {retry})\n")
                         break
                 except ConnectionRefusedError as e:
                     debug_logger.log_warning(f"[BrowserCaptcha] 标签页连接丢失: {e}")
-                    return None
+                    sys.stderr.write(f"[DEBUG_TRACE] ConnectionRefusedError: {e}\n")
+                    return False
                 except Exception as e:
-                    debug_logger.log_warning(f"[BrowserCaptcha] 等待页面异常: {e}，重试 {retry + 1}/60...")
+                    sys.stderr.write(f"[DEBUG_TRACE] Page load exception: {e}\n")
                     await asyncio.sleep(1)
             
             if not page_loaded:
+                sys.stderr.write(f"[DEBUG_TRACE] Page load TIMEOUT\n")
                 debug_logger.log_error(f"[BrowserCaptcha] 页面加载超时 (project: {project_id})")
-                try:
-                    await tab.close()
-                except:
-                    pass
-                return None
+                try: await tab.close()
+                except: pass
+                return False
+            
+            # [DEBUG] Log actual page URL after load to verify no unexpected redirect occurred
+            try:
+                actual_url = await tab.evaluate("window.location.href")
+                sys.stderr.write(f"[DEBUG_TRACE] Actual URL after load: {actual_url}\n")
+                debug_logger.log_info(f"[BrowserCaptcha] [DEBUG] 页面加载完成，實際 URL: {actual_url}")
+            except Exception as e:
+                sys.stderr.write(f"[DEBUG_TRACE] Failed to get content URL: {e}\n")
             
             # 等待 reCAPTCHA 加载
-            recaptcha_ready = await self._wait_for_recaptcha(tab)
+            sys.stderr.write(f"[DEBUG_TRACE] Calling _wait_for_recaptcha...\n")
+            recaptcha_ready = await self._wait_for_recaptcha(tab, timeout_loops=60) # Increased to 30s
+            sys.stderr.write(f"[DEBUG_TRACE] _wait_for_recaptcha result: {recaptcha_ready}\n")
             
             if not recaptcha_ready:
+                sys.stderr.write(f"[DEBUG_TRACE] Recaptcha NOT ready. Closing tab.\n")
                 debug_logger.log_error(f"[BrowserCaptcha] reCAPTCHA 加载失败 (project: {project_id})")
                 try:
                     await tab.close()
                 except:
                     pass
-                return None
+                return False
             
-            # 创建常驻信息对象
-            resident_info = ResidentTabInfo(tab, project_id)
-            resident_info.recaptcha_ready = True
+            # [FIX] CRITICAL: The object is already created, just update its flag!
+            resident_info.recaptcha_ready = True # We already verified it above
             
-            debug_logger.log_info(f"[BrowserCaptcha] ✅ 常驻标签页创建成功 (project: {project_id})")
-            return resident_info
+            debug_logger.log_info(f"[BrowserCaptcha] ✅ 常駐標籤頁初始化成功 (project: {project_id})")
+            return True
             
         except Exception as e:
-            debug_logger.log_error(f"[BrowserCaptcha] 创建常驻标签页异常: {e}")
-            return None
+            sys.stderr.write(f"[DEBUG_TRACE] _navigate_resident_tab EXCEPTION: {e}\n")
+            traceback.print_exc()
+            debug_logger.log_error(f"[BrowserCaptcha] 初始化常駐標籤頁異常: {e}")
+            if tab:
+                try: await tab.close()
+                except: pass
+            return False
 
     async def _close_resident_tab(self, account_id: str, project_id: str):
         """关闭指定 project_id 的常駐標籤頁"""
@@ -530,21 +656,21 @@ class BrowserCaptchaService:
                 except Exception as e:
                     debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 關閉標籤頁時異常: {e}")
 
-    async def _get_token_legacy(self, browser, project_id: str, account_id: str) -> Optional[str]:
-        """传统模式获取 reCAPTCHA token（每次创建新标签页）
-
-        Args:
-            project_id: Flow项目ID
-
-        Returns:
-            reCAPTCHA token字符串，如果获取失败返回None
-        """
+    async def _get_token_legacy(self, browser, project_id: str, account_id: str, action: str = "IMAGE_GENERATION") -> tuple[Optional[str], Optional[str]]:
+        sys.stderr.write(f"\n[DEBUG_TRACE] Entering _get_token_legacy. ProjectID: {project_id}\n")
+        """传统模式获取 reCAPTCHA token（每次创建新标签页）"""
         start_time = time.time()
         tab = None
 
         try:
+            # [REVERTED] Use project-specific URL for legacy mode as requested.
             website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
-            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] [Legacy] 訪問頁面: {website_url}")
+            sys.stderr.write(f"[DEBUG_TRACE] Legacy Target URL: {website_url} (Project Specific)\n")
+            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] [Legacy] 訪問項目頁面: {website_url} (Project ID: {project_id})")
+            
+            # Sanity check for project_id (just logging)
+            if not project_id or "project" in str(project_id).lower() or "[" in str(project_id):
+                 debug_logger.log_warning(f"[BrowserCaptcha] [Legacy] ⚠️ 注意: Project ID 格式不尋常: {project_id}")
 
             # 新建标签页并访问页面
             tab = await browser.get(website_url, new_tab=True)
@@ -561,28 +687,30 @@ class BrowserCaptchaService:
                 await tab.sleep(0.5)
 
             # 等待 reCAPTCHA 加载
-            recaptcha_ready = await self._wait_for_recaptcha(tab)
+            recaptcha_ready = await self._wait_for_recaptcha(tab, timeout_loops=60) # Increased timeout
 
             if not recaptcha_ready:
-                debug_logger.log_error("[BrowserCaptcha] [Legacy] reCAPTCHA 无法加载")
+                debug_logger.log_error(f"[BrowserCaptcha] [Legacy] reCAPTCHA 无法加载 (project: {project_id})")
                 return None
 
             # 执行 reCAPTCHA
-            debug_logger.log_info("[BrowserCaptcha] [Legacy] 执行 reCAPTCHA 验证...")
-            token = await self._execute_recaptcha_on_tab(tab)
+            debug_logger.log_info(f"[BrowserCaptcha] [Legacy] 执行 reCAPTCHA 验证 (action: {action})...")
+            token = await self._execute_recaptcha_on_tab(tab, action)
 
             duration_ms = (time.time() - start_time) * 1000
 
             if token:
+                # [FIX] Get full cookies
+                cookies = await self._get_full_cookies(tab)
                 debug_logger.log_info(f"[BrowserCaptcha] [Legacy] ✅ Token获取成功（耗时 {duration_ms:.0f}ms）")
-                return token
+                return token, cookies
             else:
                 debug_logger.log_error("[BrowserCaptcha] [Legacy] Token获取失败（返回null）")
-                return None
+                return None, None
 
         except Exception as e:
             debug_logger.log_error(f"[BrowserCaptcha] [Legacy] 获取token异常: {str(e)}")
-            return None
+            return None, None
         finally:
             # 关闭标签页（但保留浏览器）
             if tab:
@@ -590,6 +718,48 @@ class BrowserCaptchaService:
                     await tab.close()
                 except Exception:
                     pass
+    async def _get_full_cookies(self, tab) -> Optional[str]:
+        """使用 CDP 獲取相關域名的所有 Cookie 並格式化"""
+        try:
+            # [FIX] 使用更底層但也更穩定的方式獲取所有 Cookie
+            cookies_obj = await tab.send(cdp.network.get_all_cookies())
+            
+            if not cookies_obj:
+                sys.stderr.write("[DEBUG_TRACE] _get_full_cookies: No cookies found!\n")
+                return None
+            
+            # 篩選僅與 Google 相關的 Cookie，避免 Header 過大
+            allowed_domains = [".google.com", "labs.google", "google.com", "www.google.com"]
+            
+            cookie_list = []
+            st_found = False
+            
+            for cookie in cookies_obj:
+                # 檢查域名是否匹配
+                match = False
+                for domain in allowed_domains:
+                    if domain in cookie.domain:
+                        match = True
+                        break
+                
+                if not match:
+                    continue
+                
+                # 格式化: name=value
+                cookie_list.append(f"{cookie.name}={cookie.value}")
+                
+                if "__Secure-next-auth.session-token" in cookie.name:
+                    st_found = True
+            
+            if not cookie_list:
+                return None
+                
+            full_cookies = "; ".join(cookie_list)
+            sys.stderr.write(f"[DEBUG_TRACE] _get_full_cookies: Filtered to {len(cookie_list)}/56+ cookies. ST_Found: {st_found}\n")
+            return full_cookies
+        except Exception as e:
+            sys.stderr.write(f"[DEBUG_TRACE] _get_full_cookies EXCEPTION: {e}\n")
+            return None
 
     async def close(self):
         """关闭所有浏览器实例"""
@@ -627,20 +797,20 @@ class BrowserCaptchaService:
 
     async def keep_alive_all_tabs(self):
         """主動對所有常駐標籤頁進行刷新，防止 Session 被 Google 判定為閒置"""
-        debug_logger.log_info("[BrowserCaptcha] 正在執行全域標籤頁保活 (Keep-Alive)...")
+        # [FIX] 暫時關閉全域 reload，因為這會導致使用者看到的視窗被意外刷新跳轉。
+        # 改為執行輕量級指令，只要讓瀏覽器有活動即可。
+        debug_logger.log_info("[BrowserCaptcha] 正在執行輕量級標籤頁保活 (Activity Only)...")
         async with self._resident_lock:
             for account_id, projects in self._account_resident_tabs.items():
                 for project_id, resident_info in projects.items():
                     if resident_info and resident_info.tab:
                         try:
-                            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 刷新 project_id={project_id} 標籤頁...")
-                            await resident_info.tab.reload()
-                            # [FIX] 刷新後立即強制最小化，防止它跳到前景
-                            await self._minimize_window(account_id)
-                            # 隨機等待 1-3 秒，模擬人為操作感
-                            await asyncio.sleep(1 + (time.time() % 2))
+                            # [FIX] 改用 evaluate 而非 reload，徹底解決「第二次跳轉」的問題
+                            await resident_info.tab.evaluate("console.log('Keep-alive check')")
+                            # 隨機等待 1s，維持心跳感
+                            await asyncio.sleep(1)
                         except Exception as e:
-                            debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 保活刷新失敗: {e}")
+                            debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 保活失敗: {e}")
 
     async def _minimize_window(self, account_id: str):
         """強制最小化特定帳號的瀏覽器視窗"""
@@ -662,8 +832,9 @@ class BrowserCaptchaService:
         account_id = account_id.lower()
         await self.initialize_for_account(account_id)
         browser = self.browser_instances[account_id]
-        tab = await browser.get("https://accounts.google.com/")
-        debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 已打開登錄窗口。")
+        # [FIX] 導向 Flow 首頁而非直接導向 Google 登錄，增加穩定感
+        tab = await browser.get("https://labs.google/fx/tools/flow")
+        debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 已打開 Flow 儀表板窗口。")
 
     # ========== Session Token 刷新 ==========
 
@@ -686,12 +857,17 @@ class BrowserCaptchaService:
             
             # 如果该 project_id 没有常驻标签页，则创建
             if resident_info is None:
-                debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] project_id={project_id} 沒有常駐標籤頁，正在創建...")
-                resident_info = await self._create_resident_tab(browser, project_id)
-                if resident_info is None:
-                    debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 無法為 project_id={project_id} 創建常駐標籤頁")
-                    return None
+                debug_logger.log_info(f"[BrowserCaptcha] [REFRESH_ST] 帳號 [{account_id}] project_id={project_id} 沒有常駐標籤頁，正在創建...")
+                # 我們直接在鎖內建立對象並標記，防止併發請求開出多個分頁
+                resident_info = ResidentTabInfo(None, project_id)
                 self._account_resident_tabs[account_id][project_id] = resident_info
+                
+                # REFRESH_ST 時不一定有 new st，但導航邏輯會處理基本跳轉
+                success = await self._navigate_resident_tab(resident_info, browser, caller="REFRESH_ST")
+                if not success:
+                    debug_logger.log_warning(f"[BrowserCaptcha] 帳號 [{account_id}] 無法為 project_id={project_id} 創建常駐標籤頁")
+                    del self._account_resident_tabs[account_id][project_id]
+                    return None
         
         if not resident_info or not resident_info.tab:
             debug_logger.log_error(f"[BrowserCaptcha] 无法获取常驻标签页")
@@ -700,22 +876,12 @@ class BrowserCaptchaService:
         tab = resident_info.tab
         
         try:
-            # 刷新页面以获取最新的 cookies
-            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 刷新常驻标签页以获取最新 cookies...")
-            await tab.reload()
+            # [FIX] 移除 tab.reload()。獲取 Cookies 不需要重新整理頁面，
+            # 頻繁 reload 會導致使用者正在操作的視窗發生意外跳轉。
+            debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] 獲取當前分頁 cookies (不進行 reload)")
             
-            # 等待页面加载完成
-            for i in range(30):
-                await asyncio.sleep(1)
-                try:
-                    ready_state = await tab.evaluate("document.readyState")
-                    if ready_state == "complete":
-                        break
-                except Exception:
-                    pass
-            
-            # 额外等待确保 cookies 已设置
-            await asyncio.sleep(2)
+            # 等待一小段時間確保非同步狀態穩定
+            await asyncio.sleep(1)
             
             # 从 cookies 中提取 __Secure-next-auth.session-token
             # nodriver 可以通过 browser 获取 cookies
@@ -757,23 +923,22 @@ class BrowserCaptchaService:
         except Exception as e:
             debug_logger.log_error(f"[BrowserCaptcha] 帳號 [{account_id}] 刷新 Session Token 異常: {str(e)}")
             
-            # 常驻标签页可能已失效，尝试重建
+            # 常驻标签页可能已失效，嘗試重新導航
             async with self._resident_lock:
-                await self._close_resident_tab(account_id, project_id)
-                resident_info = await self._create_resident_tab(browser, project_id)
-                if resident_info:
-                    if account_id not in self._account_resident_tabs:
-                        self._account_resident_tabs[account_id] = {}
-                    self._account_resident_tabs[account_id][project_id] = resident_info
-                    # 重建后再次尝试获取
-                    try:
-                        cookies = await browser.cookies.get_all()
-                        for cookie in cookies:
-                            if cookie.name == "__Secure-next-auth.session-token":
-                                debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] ✅ 重建後 Session Token 獲取成功")
-                                return cookie.value
-                    except Exception:
-                        pass
+                # 不再重建對象，直接導航現有分頁
+                resident_info = self._account_resident_tabs.get(account_id, {}).get(project_id)
+                if resident_info and resident_info.tab:
+                    success = await self._navigate_resident_tab(resident_info, browser, caller="REFRESH_ST_RETRY")
+                    if success:
+                        # 再次嘗試獲取 Cookie
+                        try:
+                            cookies = await browser.cookies.get_all()
+                            for cookie in cookies:
+                                if cookie.name == "__Secure-next-auth.session-token":
+                                    debug_logger.log_info(f"[BrowserCaptcha] 帳號 [{account_id}] ✅ 重刷後 Session Token 獲獲成功")
+                                    return cookie.value
+                        except Exception:
+                            pass
             
             return None
 
