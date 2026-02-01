@@ -88,56 +88,59 @@ async def lifespan(app: FastAPI):
         browser_service = await BrowserCaptchaService.get_instance(db)
         print("[OK] Browser captcha service initialized (nodriver mode)")
         
-        # [FIX] 启动常驻模式：为所有活躍帳號預載入瀏覽器
-        tokens = await token_manager.get_all_tokens()
-        active_emails = set()
-        for t in tokens:
-            if t.is_active and t.email:
-                active_emails.add(t.email.lower())
-        
-        if not active_emails:
-            active_emails.add("default")
-        
-        # [FIX] 服務啟動時先清理所有關聯的 Chrome 進程，確保環境乾淨
-        import psutil
-        browser_data_base = os.path.join(os.getcwd(), "browser_data").lower()
-        print(f"[CLEANUP] Cleaning up old browser processes (base dir: {browser_data_base})...")
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                if proc.info['name'] == 'chrome.exe':
-                    cmdline = " ".join(proc.info['cmdline'] or []).lower()
-                    if browser_data_base in cmdline:
-                        print(f"[WARN] Cleaning up leftover Chrome process (PID: {proc.info['pid']})")
-                        proc.terminate() # [FIX] Use terminate() for graceful shutdown to save profile data
-                        try:
-                            proc.wait(timeout=3)
-                        except psutil.TimeoutExpired:
-                            proc.kill() # Force kill if stuck
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
-        # 給 Chrome 一點時間完全關閉
-        await asyncio.sleep(1)
-            
-        # 預先初始化並打開登錄窗口 (改為異步背景執行，避免阻塞服務啟動)
-        print(f"[START] Launching browsers for active accounts: {active_emails}")
-
-        async def delayed_browser_start(acc_id):
-            try:
-                await browser_service.open_login_window(acc_id)
-                print(f"[OK] [Background] Browser window opened for account: {acc_id}.")
-            except Exception as e:
-                print(f"[WARN] [Background] Failed to open login window for {acc_id}: {e}")
-
-        browser_service = await BrowserCaptchaService.get_instance(db)
-        
-        # [FIX] 為每個帳號啟動背景任務
-        for idx, email in enumerate(active_emails):
-            # 為每個帳號延遲不同時間，避免同時啟動 (間隔 1 秒)
-            async def start_with_delay(acc_id, delay):
-                await asyncio.sleep(delay)
-                await delayed_browser_start(acc_id)
-            asyncio.create_task(start_with_delay(email, idx * 1))
+        # [DISABLED] 瀏覽器自動打碼功能暫時停用 (403 reCAPTCHA 驗證失敗)
+        # 待未來整合 NopeCHA 或其他打碼服務後再啟用
+        # -------------------------------------------------------------------
+        # # [FIX] 启动常驻模式：为所有活躍帳號預載入瀏覽器
+        # tokens = await token_manager.get_all_tokens()
+        # active_emails = set()
+        # for t in tokens:
+        #     if t.is_active and t.email:
+        #         active_emails.add(t.email.lower())
+        # 
+        # if not active_emails:
+        #     active_emails.add("default")
+        # 
+        # # [FIX] 服務啟動時先清理所有關聯的 Chrome 進程，確保環境乾淨
+        # import psutil
+        # browser_data_base = os.path.join(os.getcwd(), "browser_data").lower()
+        # print(f"[CLEANUP] Cleaning up old browser processes (base dir: {browser_data_base})...")
+        # for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        #     try:
+        #         if proc.info['name'] == 'chrome.exe':
+        #             cmdline = " ".join(proc.info['cmdline'] or []).lower()
+        #             if browser_data_base in cmdline:
+        #                 print(f"[WARN] Cleaning up leftover Chrome process (PID: {proc.info['pid']})")
+        #                 proc.terminate() # [FIX] Use terminate() for graceful shutdown to save profile data
+        #                 try:
+        #                     proc.wait(timeout=3)
+        #                 except psutil.TimeoutExpired:
+        #                     proc.kill() # Force kill if stuck
+        #     except (psutil.NoSuchProcess, psutil.AccessDenied):
+        #         pass
+        # 
+        # # 給 Chrome 一點時間完全關閉
+        # await asyncio.sleep(1)
+        #     
+        # # 預先初始化並打開登錄窗口 (改為異步背景執行，避免阻塞服務啟動)
+        # print(f"[START] Launching browsers for active accounts: {active_emails}")
+        #
+        # async def delayed_browser_start(acc_id):
+        #     try:
+        #         await browser_service.open_login_window(acc_id)
+        #         print(f"[OK] [Background] Browser window opened for account: {acc_id}.")
+        #     except Exception as e:
+        #         print(f"[WARN] [Background] Failed to open login window for {acc_id}: {e}")
+        #
+        # browser_service = await BrowserCaptchaService.get_instance(db)
+        # 
+        # # [FIX] 為每個帳號啟動背景任務
+        # for idx, email in enumerate(active_emails):
+        #     # 為每個帳號延遲不同時間，避免同時啟動 (間隔 1 秒)
+        #     async def start_with_delay(acc_id, delay):
+        #         await asyncio.sleep(delay)
+        #         await delayed_browser_start(acc_id)
+        #     asyncio.create_task(start_with_delay(email, idx * 1))
     elif captcha_config.captcha_method == "browser":
         from .services.browser_captcha import BrowserCaptchaService
         browser_service = await BrowserCaptchaService.get_instance(db)
